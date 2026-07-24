@@ -1,0 +1,25 @@
+<launch>
+  <arg name="node_name" default="pcd_correction_node"/>
+  <arg name="config_file" default="$(find intensity_image_enhance)/config/pcd_correction.yaml"/>
+  <arg name="raw_cloud_topic" default="/raw_cloud"/>
+  <arg name="deskewed_cloud_topic" default="/deskewed_cloud"/>
+  <arg name="start_rviz" default="true"/>
+  <arg name="rviz_config_file" default="$(find intensity_image_enhance)/rviz/pcd_correction.rviz"/>
+
+  <node pkg="intensity_image_enhance"
+        type="pcd_correction_node"
+        name="$(arg node_name)"
+        output="screen">
+    <rosparam command="load" file="$(arg config_file)"/>
+
+    <remap from="raw_cloud" to="$(arg raw_cloud_topic)"/>
+    <remap from="deskewed_cloud" to="$(arg deskewed_cloud_topic)"/>
+  </node>
+
+  <node if="$(arg start_rviz)"
+        pkg="rviz"
+        type="rviz"
+        name="intensity_image_enhance_rviz"
+        args="-d $(arg rviz_config_file)"
+        output="screen"/>
+</launch>

@@ -1,0 +1,106 @@
+# Topics
+cloud_topic: "/lidar_points"
+sampled_cloud_topic: "/sampled_points"
+Tguess_topic: "/Tguess"
+
+# Output
+output_dir: "/home/lb/Piont_cloudToImage/lidar_output"
+save_image_results: true
+save_pcd_results: true
+save_match_text_results: true
+show_match_labels: true
+publish_match_images: true
+publish_raw_intensity_image: true
+publish_enhanced_intensity_image: true
+publish_matched_points: true
+# Keep the newest result available when an RViz Display is enabled after bag playback pauses.
+latch_published_topics: true
+raw_intensity_image_topic: "/raw_intensity_image"
+enhanced_intensity_image_topic: "/intensity_enh_image"
+matched_orb_image_topic: "/matched_orb_image"
+matched_2d_image_topic: "/matched_2d_image"
+matched_3d_image_topic: "/matched_3d_image"
+matched_prev_points_topic: "/matched_prev_orb_points"
+matched_cur_points_topic: "/matched_cur_orb_points"
+
+# Projection
+projection_mode: "ring"
+v_res: 128
+h_res: 500
+h_fov_deg: 120.0
+v_min_deg: -12.5
+v_max_deg: 12.9
+sample_step: 1
+filter_origin_points: true
+origin_filter_eps: 1.0e-6
+store_all_pixel_points: true
+
+# Line sampling
+enable_line_sampling: true
+source_lines: 128
+target_lines: 32
+remap_ring_to_compact: true
+
+# Deskew
+# The optimized pose is T(cur->prev); the node internally inverts it to deskew the current scan.
+enable_deskew_current: false
+deskew_use_inverse_tguess: false
+deskew_min_range: 0.1
+deskew_placeholder_eps: 1.0e-6
+sampling_filter_invalid: true
+deskew_scale_by_time: true
+deskew_scale_min: 0.2
+deskew_scale_max: 2.0
+
+# Matching / RANSAC
+ratio_thresh: 0.90
+hamming_thresh: 90
+ransac_2d_reproj: 3.0
+ransac_3d_thresh: 0.3
+ransac_3d_iters: 100
+
+# Joint Tguess / deskew optimization
+enable_joint_tguess_deskew: true
+# all: use all 3D points inside matched pixels with local nearest-neighbor pairing
+# max_intensity: use only the max-intensity 3D point selected by 3D-RANSAC
+joint_pixel_match_mode: "max_intensity"
+joint_tguess_max_iters: 8
+joint_tguess_min_matches: 6
+joint_tguess_huber_delta: 0.2
+joint_tguess_intensity_weight_scale: 0.5
+joint_tguess_num_threads: 8
+enable_joint_pair_outlier_rejection: true
+joint_pair_outlier_abs_thresh: 0.3
+joint_pair_outlier_mad_k: 4.0
+joint_pair_outlier_min_thresh: 0.05
+
+# Image enhancement
+enable_blur: false
+enable_bilateral_filter: true
+bilateral_d: 5
+bilateral_sigma_color: 30.0
+bilateral_sigma_space: 5.0
+contrast_mode: "clahe"
+orb_vis_radius: 2
+orb_vis_thickness: 0.5
+match_vis_radius: 2
+match_vis_thickness: 0.5
+
+# ORB
+orb_nfeatures: 200
+orb_scaleFactor: 1.1
+orb_nlevels: 6
+orb_edgeThreshold: 5
+orb_patchSize: 31
+orb_fastThreshold: 1
+orb_wta_k: 2
+# 0: HARRIS_SCORE, 1: FAST_SCORE
+orb_score_type: 1
+
+# Parallelism
+enable_ransac_2d: true
+enable_multithread: true
+num_threads: 8
+enable_parallel_projection: true
+enable_parallel_ransac3d: true
+ransac3d_threads: 8

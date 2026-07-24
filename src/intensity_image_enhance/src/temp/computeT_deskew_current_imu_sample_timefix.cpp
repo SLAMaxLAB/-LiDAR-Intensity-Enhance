@@ -1,0 +1,2223 @@
+// lidar_intensity_orb_match_dual_sampling_pubonly.cpp
+//
+// 两种投影模式可选：
+//  1) angle:  行 = elevation 角，列 = azimuth 角
+//  2) ring :  行 = ring 线束编号，列 = azimuth 角
+//
+// 新增：
+//  - 对原始 128 线点云按线束均匀采样到 128/64/32/16（参数可选）
+//  - 只发布采样后的点云，不参与强度图投影
+//
+// 强度图投影：
+//  - 始终使用原始 128 线点云（回调里收到的 msg）进行投影
+//  - 剔除 intensity <= 0 的点
+//  - 一个像素内取强度最大的点
+//  - 点云读取使用裸指针 + offset
+//  - 投影阶段拆分：offset / project / merge / normalize + sampling，各自耗时输出
+//
+// 后续：图像增强 + ORB + 匹配 + 2D/3D-RANSAC + 刚体估计 + time_log
+//
+// 主要参数（ROS param，可通过 launch 设置）:
+//
+//  ~projection_mode            : "angle" 或 "ring"（默认 "angle"）
+//  ~output_dir                 : 输出目录，默认 "./lidar_output"
+//  ~cloud_topic                : 点云话题，默认 "/lidar_points"
+//  ~sampled_cloud_topic        : 采样后点云话题，默认 "sampled_points"
+//  ~v_res                      : 垂直分辨率（行数），默认 128
+//  ~h_res                      : 水平分辨率（列数），默认 500
+//  ~h_fov_deg                  : 水平 FOV，默认 120 度
+//  ~v_min_deg, ~v_max_deg      : 垂直角范围（angle 模式用），默认 -12.5 ~ 12.9
+//  ~sample_step                : 点云采样步长（按点索引采样），默认 1（不采样）
+//
+//  ~enable_line_sampling       : 是否启用按 ring 采样并发布，默认 false
+//  ~source_lines               : 原始线数，默认 128
+//  ~target_lines               : 目标线数，默认 128（建议设为 128/64/32/16）
+//  ~remap_ring_to_compact      : 是否把被选中的 ring 映射到 [0, target_lines-1]，默认 true
+//
+//  ~ratio_thresh               : ORB 比率阈值，默认 0.75
+//  ~hamming_thresh             : Hamming 距离阈值，默认 50
+//  ~ransac_2d_reproj           : 2D RANSAC 重投影误差阈，默认 3 像素
+//  ~ransac_3d_thresh           : 3D RANSAC 距离阈，默认 0.2 m
+//  ~ransac_3d_iters            : 3D RANSAC 迭代次数，默认 100
+//
+//  ~enable_blur                : 是否高斯模糊，默认 true
+//  ~contrast_mode              : "none" / "equalize" / "clahe"，默认 "clahe"
+//  ~orb_vis_radius             : ORB 可视化点半径，默认 2
+//
+//  ~enable_ransac_2d           : 是否启用 2D-RANSAC，默认 true
+//  ~enable_multithread         : 是否启用多线程（OpenCV+OMP），默认 true
+//  ~num_threads                : 默认线程数，默认 8
+//  ~enable_parallel_projection : 投影阶段是否并行，默认 true
+//  ~enable_parallel_ransac3d   : 3D-RANSAC 是否并行，默认 true
+//  ~ransac3d_threads           : 3D-RANSAC 线程数，默认 = num_threads
+//
+// 输出：
+//  intensity_raw_#.png      : 原始强度图
+//  intensity_enh_#.png      : 增强强度图
+//  orb_vis_#.png            : ORB 关键点可视化
+//  match_2d_#.png           : 2D 匹配可视化
+//  match_3d_#.png           : 3D 内点匹配可视化
+//  matches_3d_#.txt         : 3D 对应点列表
+//  all_Tguess.txt           : 每帧估计的 T_car（tx ty tz roll pitch yaw）
+//  time_log.csv             : 每帧各阶段耗时（ms）
+//
+// 注意：需要点云包含字段 x,y,z,intensity，若使用 ring 模式或线束采样，还需要 ring 字段。
+
+#include <ros/ros.h>
+#include <sensor_msgs/PointCloud2.h>
+#include <sensor_msgs/PointField.h>
+#include <sensor_msgs/Imu.h>
+
+#include <deque>
+#include <mutex>
+
+#include <Eigen/Geometry>
+#include <nav_msgs/Odometry.h>
+#include <tf/transform_datatypes.h>
+
+#include <opencv2/opencv.hpp>
+#include <opencv2/features2d.hpp>
+
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <errno.h>
+
+#include <vector>
+#include <algorithm>
+#include <string>
+#include <cmath>
+#include <chrono>
+#include <random>
+#include <fstream>
+#include <iomanip>
+#include <cstring>
+#include <limits>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+template <typename T>
+inline T clampValue(T v, T lo, T hi)
+{
+    return (v < lo) ? lo : (v > hi ? hi : v);
+}
+
+inline double dist3D2(const cv::Point3f &a, const cv::Point3f &b)
+{
+    double dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
+    return dx * dx + dy * dy + dz * dz;
+}
+
+class LidarIntensityORBMatchDual
+{
+public:
+    LidarIntensityORBMatchDual(ros::NodeHandle &nh)
+        : nh_(nh), frame_idx_(0), has_prev_frame_(false)
+    {
+        // -------- 参数读取 --------
+        nh_.param<std::string>("projection_mode", projection_mode_, std::string("ring")); // "angle" 或 "ring"
+        nh_.param<std::string>("output_dir", output_dir_, std::string("./lidar_output"));
+        nh_.param<std::string>("cloud_topic", cloud_topic_, std::string("/lidar_points"));
+        nh_.param<std::string>("sampled_cloud_topic", sampled_cloud_topic_, std::string("/sampled_points"));
+        nh_.param<std::string>("Tguess_topic", Tguess_topic_, std::string("/Tguess"));
+
+        nh_.param<int>("v_res", v_res_, 128);
+        nh_.param<int>("h_res", h_res_, 500);
+        nh_.param<double>("h_fov_deg", h_fov_deg_, 120.0);
+        nh_.param<double>("v_min_deg", v_min_deg_, -12.5);
+        nh_.param<double>("v_max_deg", v_max_deg_, 12.9);
+        nh_.param<int>("sample_step", sample_step_, 1);
+
+        nh_.param<bool>("enable_line_sampling", enable_line_sampling_, true);
+        nh_.param<int>("source_lines", source_lines_, 128);
+        nh_.param<int>("target_lines", target_lines_, 32);
+        nh_.param<bool>("remap_ring_to_compact", remap_ring_to_compact_, true);
+
+        // deskew & filtering (for Hesai AT128 with per-point timestamp)
+        nh_.param<bool>("enable_deskew_current", enable_deskew_current_, true);
+        nh_.param<bool>("deskew_use_inverse_tguess", deskew_use_inverse_tguess_, false);
+        nh_.param<float>("deskew_min_range", deskew_min_range_, 0.1f);
+        nh_.param<float>("deskew_placeholder_eps", deskew_placeholder_eps_, 1e-6f);
+        nh_.param<bool>("sampling_filter_invalid", sampling_filter_invalid_, true);
+
+        // IMU deskew (rotation) for current frame
+        nh_.param<bool>("enable_imu_deskew", enable_imu_deskew_, true);
+        nh_.param<bool>("imu_fallback_to_tguess", imu_fallback_to_tguess_, true);
+        nh_.param<std::string>("imu_topic", imu_topic_, std::string("/imu/data"));
+        nh_.param<bool>("imu_use_orientation", imu_use_orientation_, true);
+        nh_.param<bool>("imu_integrate_gyro_when_no_orientation", imu_integrate_gyro_when_no_orientation_, true);
+        nh_.param<int>("imu_table_size", imu_table_size_, 200);
+        nh_.param<bool>("imu_table_interp", imu_table_interp_, false);
+        nh_.param<int>("imu_rel_mode", imu_rel_mode_, 0); // 0: q_rel = q0^{-1}*q(t)  1: q_rel = q0*q(t)^{-1}
+        nh_.param<double>("imu_time_offset_sec", imu_time_offset_sec_, 0.0);
+        nh_.param<bool>("imu_auto_time_offset", imu_auto_time_offset_, true);
+        nh_.param<double>("imu_auto_offset_threshold", imu_auto_offset_threshold_, 1.0);
+        nh_.param<double>("imu_buffer_sec", imu_buffer_sec_, 2.0);
+        nh_.param<double>("imu_to_lidar_roll_deg", imu_to_lidar_roll_deg_, 0.0);
+        nh_.param<double>("imu_to_lidar_pitch_deg", imu_to_lidar_pitch_deg_, 0.0);
+        nh_.param<double>("imu_to_lidar_yaw_deg", imu_to_lidar_yaw_deg_, 0.0);
+
+
+
+        nh_.param<float>("ratio_thresh", ratio_thresh_, 0.75f);
+        nh_.param<int>("hamming_thresh", hamming_thresh_, 50);
+        nh_.param<double>("ransac_2d_reproj", ransac_2d_reproj_, 3.0);
+        nh_.param<double>("ransac_3d_thresh", ransac_3d_thresh_, 0.1);
+        nh_.param<int>("ransac_3d_iters", ransac_3d_iters_, 100);
+
+        nh_.param<bool>("enable_blur", enable_blur_, true);
+        nh_.param<std::string>("contrast_mode", contrast_mode_, std::string("clahe"));
+        nh_.param<int>("orb_vis_radius", orb_vis_radius_, 2);
+
+        nh_.param<int>("orb_nfeatures", orb_nfeatures_, 300);
+        nh_.param<double>("orb_scaleFactor", orb_scaleFactor_, 1.1);
+        nh_.param<int>("orb_nlevels", orb_nlevels_, 4);
+        nh_.param<int>("orb_edgeThreshold", orb_edgeThreshold_, 5);
+        nh_.param<int>("orb_patchSize", orb_patchSize_, 31);
+        nh_.param<int>("orb_fastThreshold", orb_fastThreshold_, 5);
+        nh_.param<int>("orb_wta_k", orb_wta_k_, 2);
+        int orb_score_type_int = 0;
+        nh_.param<int>("orb_score_type", orb_score_type_int, 0);
+        orb_score_type_ = (orb_score_type_int == 1) ? cv::ORB::FAST_SCORE : cv::ORB::HARRIS_SCORE;
+
+        nh_.param<bool>("enable_ransac_2d", enable_ransac_2d_, true);
+        nh_.param<bool>("enable_multithread", enable_multithread_, true);
+        nh_.param<int>("num_threads", num_threads_, 6);
+        nh_.param<bool>("enable_parallel_projection", enable_parallel_projection_, true);
+        nh_.param<bool>("enable_parallel_ransac3d", enable_parallel_ransac3d_, true);
+        nh_.param<int>("ransac3d_threads", ransac3d_threads_, num_threads_);
+
+        // 创建输出目录
+        if (mkdir(output_dir_.c_str(), 0777) && errno != EEXIST)
+        {
+            ROS_WARN("mkdir failed or already exists: %s", output_dir_.c_str());
+        }
+
+        // 角度边界（弧度）
+        min_az_ = -h_fov_deg_ / 2.0 * M_PI / 180.0;
+        max_az_ = h_fov_deg_ / 2.0 * M_PI / 180.0;
+        min_el_ = v_min_deg_ * M_PI / 180.0;
+        max_el_ = v_max_deg_ * M_PI / 180.0;
+
+        // 订阅和发布
+        sub_ = nh_.subscribe(cloud_topic_, 1, &LidarIntensityORBMatchDual::callback, this);
+        sampled_pub_ = nh_.advertise<sensor_msgs::PointCloud2>(sampled_cloud_topic_, 1);
+        tguess_pub_ = nh_.advertise<nav_msgs::Odometry>(Tguess_topic_, 1);
+
+        // IMU extrinsic rotation (IMU -> LiDAR). Default identity.
+        {
+            const double roll = imu_to_lidar_roll_deg_ * M_PI / 180.0;
+            const double pitch = imu_to_lidar_pitch_deg_ * M_PI / 180.0;
+            const double yaw = imu_to_lidar_yaw_deg_ * M_PI / 180.0;
+            Eigen::AngleAxisd Rx(roll, Eigen::Vector3d::UnitX());
+            Eigen::AngleAxisd Ry(pitch, Eigen::Vector3d::UnitY());
+            Eigen::AngleAxisd Rz(yaw, Eigen::Vector3d::UnitZ());
+            q_imu_to_lidar_ = Eigen::Quaterniond(Rz * Ry * Rx);
+            q_imu_to_lidar_.normalize();
+        }
+
+        // IMU subscriber (optional)
+        imu_int_inited_ = false;
+        imu_int_last_t_ = 0.0;
+        imu_int_q_ = Eigen::Quaterniond::Identity();
+        imu_have_orientation_ = false;
+
+        if (enable_imu_deskew_)
+        {
+            imu_sub_ = nh_.subscribe(imu_topic_, 2000, &LidarIntensityORBMatchDual::imuCallback, this);
+            ROS_INFO("IMU deskew enabled. imu_topic=%s table_size=%d rel_mode=%d buffer=%.2fs fallback_to_tguess=%s",
+                     imu_topic_.c_str(), imu_table_size_, imu_rel_mode_, imu_buffer_sec_,
+                     (imu_fallback_to_tguess_ ? "true" : "false"));
+        }
+
+
+        // RNG
+        rng_.seed(std::random_device{}());
+
+        // OpenCV 线程设置
+        if (enable_multithread_)
+        {
+            cv::setUseOptimized(true);
+            cv::setNumThreads(num_threads_);
+            ROS_INFO("OpenCV multithreading enabled. num_threads=%d", num_threads_);
+        }
+        else
+        {
+            cv::setNumThreads(1);
+            ROS_INFO("OpenCV multithreading disabled, force num_threads=1");
+        }
+
+        // time_log.csv
+        std::ofstream tlog(output_dir_ + "/time_log.csv", std::ios::app);
+        if (tlog.tellp() == 0)
+        {
+            tlog << "frame,sample_ms,proj_ms,enh_ms,orb_ms,match_ms,ransac2d_ms,ransac3d_ms,total_ms\n";
+        }
+        tlog.close();
+
+        ROS_INFO("Node initialized. Output dir: %s", output_dir_.c_str());
+        ROS_INFO("Image size: %d x %d ; h_fov: %.2f deg ; v_range: %.2f ~ %.2f deg",
+                 v_res_, h_res_, h_fov_deg_, v_min_deg_, v_max_deg_);
+        ROS_INFO("Projection mode = %s (\"angle\" or \"ring\")",
+                 projection_mode_.c_str());
+        ROS_INFO("Line sampling (publish only): %s, source_lines=%d target_lines=%d remap=%s",
+                 enable_line_sampling_ ? "ENABLED" : "DISABLED",
+                 source_lines_, target_lines_, remap_ring_to_compact_ ? "true" : "false");
+    }
+
+private:
+    struct PixAcc
+    {
+        float max_intensity = 0.0f;
+        float x = 0.0f, y = 0.0f, z = 0.0f;
+        bool has_point = false;
+    };
+
+    ros::NodeHandle nh_;
+    ros::Subscriber sub_;
+    ros::Subscriber imu_sub_;
+    ros::Publisher sampled_pub_;
+    ros::Publisher tguess_pub_;
+
+    std::string output_dir_;
+    std::string cloud_topic_;
+    std::string sampled_cloud_topic_;
+    std::string Tguess_topic_;
+    std::string imu_topic_;
+    std::string projection_mode_;
+
+    int v_res_, h_res_, sample_step_;
+    double h_fov_deg_, v_min_deg_, v_max_deg_;
+    double min_az_, max_az_, min_el_, max_el_;
+
+    // 线束采样相关（仅用于发布）
+    bool enable_line_sampling_;
+    int source_lines_;
+    int target_lines_;
+    bool remap_ring_to_compact_;
+
+
+    // deskew current frame by Tguess (requires per-point timestamp)
+    bool enable_deskew_current_;
+    bool deskew_use_inverse_tguess_;
+    float deskew_min_range_;
+    float deskew_placeholder_eps_;
+    bool sampling_filter_invalid_;
+
+    // IMU deskew (rotation only). Uses per-point timestamp to query IMU orientation and
+    // compensate each point to scan start.
+    bool enable_imu_deskew_;
+    bool imu_fallback_to_tguess_;
+    bool imu_use_orientation_;
+    bool imu_integrate_gyro_when_no_orientation_;
+    int imu_table_size_;
+    bool imu_table_interp_;
+    int imu_rel_mode_;
+    double imu_time_offset_sec_;
+    bool imu_auto_time_offset_;
+    double imu_auto_offset_threshold_;
+    double imu_buffer_sec_;
+
+    // IMU->LiDAR static rotation (degrees)
+    double imu_to_lidar_roll_deg_;
+    double imu_to_lidar_pitch_deg_;
+    double imu_to_lidar_yaw_deg_;
+    Eigen::Quaterniond q_imu_to_lidar_;
+
+    // IMU buffer
+    bool imu_have_orientation_;
+    bool imu_int_inited_;
+    double imu_int_last_t_;
+    Eigen::Quaterniond imu_int_q_;
+
+    struct ImuState
+    {
+        double t = 0.0; // seconds
+        Eigen::Quaterniond q = Eigen::Quaterniond::Identity();
+    };
+    std::deque<ImuState> imu_buf_;
+    mutable std::mutex imu_mutex_;
+
+
+    // ORB & RANSAC 参数
+    float ratio_thresh_;
+    int hamming_thresh_;
+    double ransac_2d_reproj_;
+    double ransac_3d_thresh_;
+    int ransac_3d_iters_;
+
+    bool enable_blur_;
+    std::string contrast_mode_;
+    int orb_vis_radius_;
+
+    int orb_nfeatures_, orb_nlevels_, orb_edgeThreshold_, orb_patchSize_, orb_fastThreshold_, orb_wta_k_;
+    double orb_scaleFactor_;
+    cv::ORB::ScoreType orb_score_type_;
+
+    bool enable_ransac_2d_;
+    bool enable_multithread_;
+    int num_threads_;
+    bool enable_parallel_projection_;
+    bool enable_parallel_ransac3d_;
+    int ransac3d_threads_;
+
+    int frame_idx_;
+    bool has_prev_frame_;
+    cv::Mat prev_img_;
+    cv::Mat prev_desc_;
+    std::vector<cv::KeyPoint> prev_kp_;
+    std::vector<float> prev_px_, prev_py_, prev_pz_;
+    std::vector<char> prev_has_;
+
+    std::mt19937 rng_;
+
+    // ---------- 3D 刚体估计 ----------
+    bool estimateRigidSVD(const std::vector<cv::Point3f> &P,
+                          const std::vector<cv::Point3f> &Q,
+                          cv::Mat &R, cv::Mat &t)
+    {
+        if (P.size() < 3)
+            return false;
+        cv::Point3d meanP(0, 0, 0), meanQ(0, 0, 0);
+        for (size_t i = 0; i < P.size(); ++i)
+        {
+            meanP += cv::Point3d(P[i].x, P[i].y, P[i].z);
+            meanQ += cv::Point3d(Q[i].x, Q[i].y, Q[i].z);
+        }
+        meanP *= 1.0 / P.size();
+        meanQ *= 1.0 / P.size();
+
+        cv::Mat H = cv::Mat::zeros(3, 3, CV_64F);
+        for (size_t i = 0; i < P.size(); ++i)
+        {
+            cv::Mat p = (cv::Mat_<double>(3, 1) << P[i].x - meanP.x, P[i].y - meanP.y, P[i].z - meanP.z);
+            cv::Mat q = (cv::Mat_<double>(1, 3) << Q[i].x - meanQ.x, Q[i].y - meanQ.y, Q[i].z - meanQ.z);
+            H += p * q;
+        }
+        cv::Mat U, S, Vt;
+        cv::SVD::compute(H, S, U, Vt);
+        R = Vt.t() * U.t();
+        if (cv::determinant(R) < 0)
+        {
+            Vt.row(2) *= -1;
+            R = Vt.t() * U.t();
+        }
+        cv::Mat meanP_m = (cv::Mat_<double>(3, 1) << meanP.x, meanP.y, meanP.z);
+        cv::Mat meanQ_m = (cv::Mat_<double>(3, 1) << meanQ.x, meanQ.y, meanQ.z);
+        t = meanQ_m - R * meanP_m;
+        return true;
+    }
+
+    inline void applyRT(const cv::Mat &R, const cv::Mat &t,
+                        const cv::Point3f &p, cv::Point3f &q) const
+    {
+        const double *r = (const double *)R.data;
+        const double *tv = (const double *)t.data;
+        double x = p.x, y = p.y, z = p.z;
+        q.x = (float)(r[0] * x + r[1] * y + r[2] * z + tv[0]);
+        q.y = (float)(r[3] * x + r[4] * y + r[5] * z + tv[1]);
+        q.z = (float)(r[6] * x + r[7] * y + r[8] * z + tv[2]);
+    }
+
+    std::vector<int> ransac3D(const std::vector<cv::Point3f> &P,
+                              const std::vector<cv::Point3f> &Q,
+                              double thresh, int iters)
+    {
+        std::vector<int> best_inliers;
+        if (P.size() < 3)
+            return best_inliers;
+        std::uniform_int_distribution<int> uni(0, (int)P.size() - 1);
+
+        for (int it = 0; it < iters; ++it)
+        {
+            int a = uni(rng_), b = uni(rng_), c = uni(rng_);
+            if (a == b || a == c || b == c)
+            {
+                --it;
+                continue;
+            }
+
+            std::vector<cv::Point3f> Ps = {P[a], P[b], P[c]};
+            std::vector<cv::Point3f> Qs = {Q[a], Q[b], Q[c]};
+            cv::Mat Rtmp, ttmp;
+            if (!estimateRigidSVD(Ps, Qs, Rtmp, ttmp))
+                continue;
+
+            std::vector<int> inliers;
+            inliers.reserve(P.size());
+            for (size_t i = 0; i < P.size(); ++i)
+            {
+                cv::Point3f q_est;
+                applyRT(Rtmp, ttmp, P[i], q_est);
+                if (std::sqrt(dist3D2(q_est, Q[i])) < thresh)
+                    inliers.push_back((int)i);
+            }
+            if (inliers.size() > best_inliers.size())
+                best_inliers.swap(inliers);
+        }
+
+        ROS_INFO("3D-RANSAC result: kept %zu / %zu (%.1f%%)",
+                 best_inliers.size(), P.size(),
+                 100.0 * best_inliers.size() / std::max<size_t>(1, P.size()));
+        return best_inliers;
+    }
+
+    std::vector<int> ransac3D_parallel(const std::vector<cv::Point3f> &P,
+                                       const std::vector<cv::Point3f> &Q,
+                                       double thresh, int iters, int threads)
+    {
+        std::vector<int> best_global;
+        if (P.size() < 3)
+            return best_global;
+        const int N = (int)P.size();
+        threads = std::max(1, threads);
+
+#ifdef _OPENMP
+#pragma omp parallel num_threads(threads)
+#endif
+        {
+            std::mt19937 rng_local((uint32_t)(0x9e3779b1u ^ (frame_idx_ * 1315423911u)));
+#ifdef _OPENMP
+            rng_local.discard((uint32_t)omp_get_thread_num() * 7);
+#endif
+            std::uniform_int_distribution<int> uni(0, N - 1);
+
+            std::vector<int> best_local;
+
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+            for (int it = 0; it < iters; ++it)
+            {
+                int a = uni(rng_local), b = uni(rng_local), c = uni(rng_local);
+                if (a == b || a == c || b == c)
+                {
+                    --it;
+                    continue;
+                }
+
+                std::vector<cv::Point3f> Ps = {P[a], P[b], P[c]};
+                std::vector<cv::Point3f> Qs = {Q[a], Q[b], Q[c]};
+                cv::Mat Rtmp, ttmp;
+                if (!estimateRigidSVD(Ps, Qs, Rtmp, ttmp))
+                    continue;
+
+                std::vector<int> inliers;
+                inliers.reserve(N);
+                for (int i = 0; i < N; ++i)
+                {
+                    cv::Point3f q_est;
+                    applyRT(Rtmp, ttmp, P[i], q_est);
+                    float dx = q_est.x - Q[i].x;
+                    float dy = q_est.y - Q[i].y;
+                    float dz = q_est.z - Q[i].z;
+                    if (std::sqrt(dx * dx + dy * dy + dz * dz) < (float)thresh)
+                        inliers.push_back(i);
+                }
+                if (inliers.size() > best_local.size())
+                    best_local.swap(inliers);
+            }
+
+#ifdef _OPENMP
+#pragma omp critical
+#endif
+            {
+                if (best_local.size() > best_global.size())
+                    best_global.swap(best_local);
+            }
+        }
+
+        ROS_INFO("3D-RANSAC(parallel) result: kept %zu / %zu (%.1f%%)",
+                 best_global.size(), P.size(),
+                 100.0 * best_global.size() / std::max<size_t>(1, P.size()));
+        return best_global;
+    }
+
+    void visualizeMatchesStacked(const cv::Mat &prev_img, const cv::Mat &cur_img,
+                                 const std::vector<cv::KeyPoint> &prev_kp,
+                                 const std::vector<cv::KeyPoint> &cur_kp,
+                                 const std::vector<cv::DMatch> &matches,
+                                 const std::string &path)
+    {
+        cv::Mat prev_color, cur_color;
+        cv::cvtColor(prev_img, prev_color, cv::COLOR_GRAY2BGR);
+        cv::cvtColor(cur_img, cur_color, cv::COLOR_GRAY2BGR);
+
+        int w = std::max(prev_color.cols, cur_color.cols);
+        int h = prev_color.rows + cur_color.rows;
+        cv::Mat canvas(h, w, CV_8UC3, cv::Scalar(0, 0, 0));
+        prev_color.copyTo(canvas(cv::Rect(0, 0, prev_color.cols, prev_color.rows)));
+        cur_color.copyTo(canvas(cv::Rect(0, prev_color.rows, cur_color.cols, cur_color.rows)));
+
+        std::mt19937 rng_local(frame_idx_);
+        std::uniform_int_distribution<int> ud(0, 255);
+
+        for (const auto &m : matches)
+        {
+            cv::Point2f a = prev_kp[m.queryIdx].pt;
+            cv::Point2f b = cur_kp[m.trainIdx].pt + cv::Point2f(0.0f, (float)prev_color.rows);
+            cv::Scalar color(ud(rng_local), ud(rng_local), ud(rng_local));
+            cv::circle(canvas, a, 2, color, -1);
+            cv::circle(canvas, b, 2, color, -1);
+            cv::line(canvas, a, b, color, 1, cv::LINE_AA);
+        }
+        cv::imwrite(path, canvas);
+    }
+
+    // ---------- 线束采样：按 ring 选择部分线束并输出新点云（只用于发布） ----------
+    bool samplePointCloudByRing(const sensor_msgs::PointCloud2 &in,
+                                sensor_msgs::PointCloud2 &out,
+                                double &t_sample_ms)
+    {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        t_sample_ms = 0.0;
+
+        if (!enable_line_sampling_ ||
+            target_lines_ >= source_lines_ ||
+            target_lines_ <= 0 ||
+            source_lines_ <= 0)
+        {
+            return false; // 不采样
+        }
+        if (source_lines_ % target_lines_ != 0)
+        {
+            ROS_WARN_THROTTLE(1.0,
+                              "line sampling disabled: source_lines(%d) %% target_lines(%d) != 0",
+                              source_lines_, target_lines_);
+            return false;
+        }
+
+        // 找 ring 字段
+        int offset_ring = -1;
+        int ring_datatype = -1;
+        for (const auto &f : in.fields)
+        {
+            if (f.name == "ring")
+            {
+                offset_ring = f.offset;
+                ring_datatype = f.datatype;
+                break;
+            }
+        }
+        if (offset_ring < 0)
+        {
+            ROS_WARN_THROTTLE(1.0,
+                              "line sampling disabled: no 'ring' field in PointCloud2.");
+            return false;
+        }
+
+
+        // 可选：过滤 NaN/占位点（(0,0,0)）和过近点，避免输出给 LOAM 后出问题
+        bool filter_invalid = sampling_filter_invalid_;
+        int offset_x = -1, offset_y = -1, offset_z = -1;
+        if (filter_invalid)
+        {
+            for (const auto &f : in.fields)
+            {
+                if (f.name == "x")
+                    offset_x = f.offset;
+                else if (f.name == "y")
+                    offset_y = f.offset;
+                else if (f.name == "z")
+                    offset_z = f.offset;
+            }
+            if (offset_x < 0 || offset_y < 0 || offset_z < 0)
+            {
+                ROS_WARN_THROTTLE(1.0, "sampling_filter_invalid enabled but x/y/z offsets not found, disable filtering.");
+                filter_invalid = false;
+            }
+        }
+
+        const size_t num_points = (size_t)in.width * in.height;
+        const uint8_t *base_ptr = in.data.data();
+        const size_t point_step = in.point_step;
+
+        int step = source_lines_ / target_lines_;
+        std::vector<int> ring_to_new(source_lines_, -1);
+        for (int i = 0; i < target_lines_; ++i)
+        {
+            int orig_ring = i * step;
+            if (orig_ring >= 0 && orig_ring < source_lines_)
+                ring_to_new[orig_ring] = target_lines_ - 1 - i;
+        }
+
+        std::vector<uint8_t> out_data;
+        out_data.reserve(in.data.size() * target_lines_ / std::max(1, source_lines_) + 256);
+
+        size_t kept_points = 0;
+        for (size_t idx = 0; idx < num_points; ++idx)
+        {
+            const uint8_t *p = base_ptr + idx * point_step;
+            int ring = 0;
+            if (ring_datatype == sensor_msgs::PointField::UINT16)
+            {
+                uint16_t r = 0;
+                std::memcpy(&r, p + offset_ring, sizeof(uint16_t));
+                ring = (int)r;
+            }
+            else if (ring_datatype == sensor_msgs::PointField::INT16)
+            {
+                int16_t r = 0;
+                std::memcpy(&r, p + offset_ring, sizeof(int16_t));
+                ring = (int)r;
+            }
+            else
+            {
+                uint16_t r = 0;
+                std::memcpy(&r, p + offset_ring, sizeof(uint16_t));
+                ring = (int)r;
+            }
+
+            if (ring < 0 || ring >= source_lines_)
+                continue;
+            int new_ring = ring_to_new[ring];
+            if (new_ring < 0)
+                continue; // 该线束未被选中
+
+            if (filter_invalid)
+            {
+                float x, y, z;
+                std::memcpy(&x, p + offset_x, sizeof(float));
+                std::memcpy(&y, p + offset_y, sizeof(float));
+                std::memcpy(&z, p + offset_z, sizeof(float));
+
+                if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
+                    continue;
+                if (std::fabs(x) + std::fabs(y) + std::fabs(z) < deskew_placeholder_eps_)
+                    continue;
+                const float r2 = x * x + y * y + z * z;
+                if (r2 < deskew_min_range_ * deskew_min_range_)
+                    continue;
+            }
+
+            size_t cur_off = out_data.size();
+            out_data.resize(cur_off + point_step);
+            std::memcpy(out_data.data() + cur_off, p, point_step);
+
+            if (remap_ring_to_compact_)
+            {
+                uint8_t *pr_out = out_data.data() + cur_off + offset_ring;
+                if (ring_datatype == sensor_msgs::PointField::UINT16)
+                {
+                    uint16_t r = (uint16_t)new_ring;
+                    std::memcpy(pr_out, &r, sizeof(uint16_t));
+                }
+                else if (ring_datatype == sensor_msgs::PointField::INT16)
+                {
+                    int16_t r = (int16_t)new_ring;
+                    std::memcpy(pr_out, &r, sizeof(int16_t));
+                }
+                else
+                {
+                    uint16_t r = (uint16_t)new_ring;
+                    std::memcpy(pr_out, &r, sizeof(uint16_t));
+                }
+            }
+            ++kept_points;
+        }
+
+        auto t1 = std::chrono::high_resolution_clock::now();
+        t_sample_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        if (kept_points == 0)
+        {
+            ROS_WARN_THROTTLE(1.0, "line sampling produced empty cloud.");
+            return false;
+        }
+
+        out = in; // 拷贝元信息
+        out.data.swap(out_data);
+        out.width = kept_points;
+        out.height = 1;
+        out.row_step = out.point_step * out.width;
+
+        ROS_INFO("[Frame %d] line sampling (publish only): points_in=%zu points_out=%zu, time=%.3f ms",
+                 frame_idx_, num_points, kept_points, t_sample_ms);
+
+        return true;
+    }
+
+    
+    // ---------- IMU 缓存：用于点云畸变矫正（旋转） ----------
+    // 注意：
+    //  1) IMU 的时间戳一般是 ROS time（epoch），点云每点 timestamp 也可能是 epoch 秒/毫秒/微秒/纳秒。
+    //     这里通过 timestamp 的数量级自动换算到秒。
+    //  2) 如果发现点云 timestamp 与 msg->header.stamp 存在一个很大的常数偏移（例如几个小时），
+    //     可以开启 imu_auto_time_offset=true，让系统自动用 header.stamp 对齐到 IMU 时间轴。
+    //
+    //  3) 仅用 IMU 时，平移 deskew 无法可靠获得（需要速度/里程计），这里默认只做“旋转 deskew”。
+    //
+    inline double pointTimestampToSec(double ts) const
+    {
+        const double a = std::fabs(ts);
+        if (a > 1e17)
+            return ts * 1e-9; // ns -> s
+        if (a > 1e14)
+            return ts * 1e-6; // us -> s
+        if (a > 1e11)
+            return ts * 1e-3; // ms -> s
+        return ts;            // already seconds
+    }
+
+    void imuCallback(const sensor_msgs::ImuConstPtr &msg)
+    {
+        if (!msg)
+            return;
+
+        const double t = msg->header.stamp.toSec();
+
+        std::lock_guard<std::mutex> lk(imu_mutex_);
+
+        // 1) 取姿态：优先使用 msg->orientation（如果协方差有效），否则可选用 gyro 积分
+        const bool ori_valid = (imu_use_orientation_ && msg->orientation_covariance[0] >= 0.0);
+
+        Eigen::Quaterniond q;
+        if (ori_valid)
+        {
+            q = Eigen::Quaterniond(msg->orientation.w,
+                                   msg->orientation.x,
+                                   msg->orientation.y,
+                                   msg->orientation.z);
+            if (q.norm() < 1e-6)
+                return;
+            q.normalize();
+            imu_have_orientation_ = true;
+        }
+        else if (imu_integrate_gyro_when_no_orientation_)
+        {
+            // 用角速度积分得到连续姿态（相对量即可，绝对朝向不重要）
+            const Eigen::Vector3d w(msg->angular_velocity.x,
+                                    msg->angular_velocity.y,
+                                    msg->angular_velocity.z);
+
+            if (!imu_int_inited_)
+            {
+                imu_int_inited_ = true;
+                imu_int_last_t_ = t;
+                imu_int_q_ = Eigen::Quaterniond::Identity();
+            }
+            else
+            {
+                const double dt = t - imu_int_last_t_;
+                if (dt > 0.0 && dt < 0.2) // dt 太大说明丢包/时间跳变，跳过本次积分
+                {
+                    const double omega = w.norm();
+                    if (omega > 1e-12)
+                    {
+                        const double angle = omega * dt;
+                        const Eigen::Vector3d axis = w / omega;
+                        const Eigen::Quaterniond dq(Eigen::AngleAxisd(angle, axis));
+                        imu_int_q_ = (imu_int_q_ * dq).normalized(); // body->world 形式的简单积分
+                    }
+                }
+                imu_int_last_t_ = t;
+            }
+            q = imu_int_q_;
+        }
+        else
+        {
+            // 没有可用姿态
+            return;
+        }
+
+        // 2) 写入缓存（保证时间单调递增）
+        if (!imu_buf_.empty() && t <= imu_buf_.back().t)
+        {
+            // 同时刻重复：覆盖；乱序：丢弃
+            if (std::fabs(t - imu_buf_.back().t) < 1e-6)
+                imu_buf_.back().q = q;
+            return;
+        }
+
+        imu_buf_.push_back(ImuState{t, q});
+
+        // 3) 控制缓存长度（按时间窗裁剪）
+        const double t_keep = t - imu_buffer_sec_;
+        while (!imu_buf_.empty() && imu_buf_.front().t < t_keep)
+            imu_buf_.pop_front();
+    }
+
+    // 在指定时间 t_query（秒）插值得到 IMU 姿态
+    bool getImuQuatAt(double t_query, Eigen::Quaterniond &q_out) const
+    {
+        std::lock_guard<std::mutex> lk(imu_mutex_);
+        if (imu_buf_.size() < 2)
+            return false;
+
+        if (t_query < imu_buf_.front().t || t_query > imu_buf_.back().t)
+            return false;
+
+        // 二分查找左右端点
+        size_t l = 0;
+        size_t r = imu_buf_.size() - 1;
+        while (l + 1 < r)
+        {
+            const size_t m = (l + r) / 2;
+            if (imu_buf_[m].t < t_query)
+                l = m;
+            else
+                r = m;
+        }
+
+        const ImuState &a = imu_buf_[l];
+        const ImuState &b = imu_buf_[r];
+        const double dt = b.t - a.t;
+        if (dt <= 1e-9)
+        {
+            q_out = a.q;
+            return true;
+        }
+
+        double alpha = (t_query - a.t) / dt;
+        alpha = clampValue(alpha, 0.0, 1.0);
+
+        q_out = a.q.slerp(alpha, b.q);
+        q_out.normalize();
+        return true;
+    }
+
+    // ---------- 点云畸变矫正：使用 IMU（旋转） ----------
+    // 输出：原地修改 cloud 中的 x/y/z（其他字段不改）
+    // 说明：
+    //  - 使用每点 timestamp 计算点的采样时刻 t_point
+    //  - 从 IMU 缓存插值得到姿态 q(t)
+    //  - 计算相对旋转 q_rel，把点从“采样时刻的 LiDAR 坐标系”补偿到“scan start 坐标系”
+    //
+    // imu_rel_mode:
+    //  - 0: q_rel = q_start^{-1} * q(t)   （常见：q 是 body->world）
+    //  - 1: q_rel = q_start * q(t)^{-1}   （如果你的 IMU orientation 定义相反，可用此模式）
+    //
+    bool deskewPointCloudInPlaceImuRotation(sensor_msgs::PointCloud2 &cloud,
+                                            double &t_deskew_ms)
+    {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        t_deskew_ms = 0.0;
+
+        if (!enable_imu_deskew_)
+            return false;
+
+        const size_t num_points = (size_t)cloud.width * cloud.height;
+        if (num_points == 0 || cloud.data.empty())
+            return false;
+
+        // 找字段 offset：x/y/z/timestamp
+        int offset_x = -1, offset_y = -1, offset_z = -1, offset_ts = -1;
+        int dtype_ts = -1;
+        for (const auto &f : cloud.fields)
+        {
+            if (f.name == "x")
+                offset_x = f.offset;
+            else if (f.name == "y")
+                offset_y = f.offset;
+            else if (f.name == "z")
+                offset_z = f.offset;
+            else if (f.name == "timestamp")
+            {
+                offset_ts = f.offset;
+                dtype_ts = f.datatype;
+            }
+        }
+        if (offset_x < 0 || offset_y < 0 || offset_z < 0 || offset_ts < 0)
+        {
+            ROS_WARN_THROTTLE(1.0, "IMU deskew disabled: missing x/y/z/timestamp field.");
+            return false;
+        }
+        if (dtype_ts != sensor_msgs::PointField::FLOAT64)
+        {
+            ROS_WARN_THROTTLE(1.0, "IMU deskew disabled: timestamp datatype is not FLOAT64 (datatype=%d).", dtype_ts);
+            return false;
+        }
+
+        const size_t point_step = cloud.point_step;
+        if ((size_t)offset_x + sizeof(float) > point_step ||
+            (size_t)offset_y + sizeof(float) > point_step ||
+            (size_t)offset_z + sizeof(float) > point_step ||
+            (size_t)offset_ts + sizeof(double) > point_step)
+        {
+            ROS_ERROR("deskewPointCloudInPlaceImuRotation: field offsets exceed point_step (point_step=%zu).", point_step);
+            return false;
+        }
+
+        uint8_t *base_ptr = cloud.data.data();
+
+        // 1) 统计 timestamp span（原始单位）+ 同时得到“秒单位”的 start/end（用于对齐 IMU）
+        double ts_min = std::numeric_limits<double>::infinity();
+        double ts_max = -std::numeric_limits<double>::infinity();
+
+        double t_min_sec = std::numeric_limits<double>::infinity();
+        double t_max_sec = -std::numeric_limits<double>::infinity();
+
+        size_t valid_for_span = 0;
+
+        const float min_range2 = deskew_min_range_ * deskew_min_range_;
+        const float eps_l1 = deskew_placeholder_eps_;
+
+        for (size_t idx = 0; idx < num_points; ++idx)
+        {
+            const uint8_t *p = base_ptr + idx * point_step;
+
+            float x, y, z;
+            std::memcpy(&x, p + offset_x, sizeof(float));
+            std::memcpy(&y, p + offset_y, sizeof(float));
+            std::memcpy(&z, p + offset_z, sizeof(float));
+
+            if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
+                continue;
+            if (std::fabs(x) + std::fabs(y) + std::fabs(z) < eps_l1)
+                continue;
+            const float r2 = x * x + y * y + z * z;
+            if (r2 < min_range2)
+                continue;
+
+            double ts;
+            std::memcpy(&ts, p + offset_ts, sizeof(double));
+            if (!std::isfinite(ts))
+                continue;
+
+            ts_min = std::min(ts_min, ts);
+            ts_max = std::max(ts_max, ts);
+
+            const double tsec = pointTimestampToSec(ts);
+            t_min_sec = std::min(t_min_sec, tsec);
+            t_max_sec = std::max(t_max_sec, tsec);
+
+            ++valid_for_span;
+        }
+
+        if (valid_for_span < 50 || !(ts_max > ts_min) || !(t_max_sec > t_min_sec))
+        {
+            ROS_WARN_THROTTLE(1.0, "IMU deskew disabled: bad timestamp span (valid=%zu).", valid_for_span);
+            return false;
+        }
+
+        const double ts_span = ts_max - ts_min;
+
+        // 2) 将点云 timestamp 对齐到 IMU 时间轴（秒）
+        //    现实中经常出现：
+        //      - 点云每点 timestamp / cloud.header.stamp 使用“传感器内部时间”（例如 2020 epoch 秒）
+        //      - IMU header.stamp 使用 ROS /clock 时间（例如 2025/2026 epoch 秒）
+        //    此时仅用 cloud.header.stamp 对齐会失败（因为 header 也可能是传感器时间）。
+        //
+        //    这里的策略：优先用 IMU buffer 的时间作为参考，自动求一个常数偏移 offset，使
+        //      t_lidar + offset  落到  IMU 时间轴上。
+        //
+        //    选择“点云参考时间”时，会在 {点云点时间中值, cloud.header.stamp} 中选择一个
+        //    更接近 IMU 时间轴的候选，以兼容不同驱动/录包方式。
+        const double t_mid_sec = 0.5 * (t_min_sec + t_max_sec);
+        double offset_sec = imu_time_offset_sec_;
+
+        // IMU buffer 必须至少覆盖两条数据用于插值
+        double imu_ref = 0.0;
+        {
+            std::lock_guard<std::mutex> lk(imu_mutex_);
+            if (imu_buf_.size() < 2)
+            {
+                ROS_WARN_THROTTLE(1.0, "IMU deskew failed: imu buffer has only %zu samples.", imu_buf_.size());
+                return false;
+            }
+            imu_ref = imu_buf_.back().t; // 用最新 IMU 时间作参考
+        }
+
+        if (imu_auto_time_offset_)
+        {
+            const double cand_a = t_mid_sec;
+            const double cand_b = cloud.header.stamp.toSec();
+            const double diff_a = imu_ref - cand_a;
+            const double diff_b = imu_ref - cand_b;
+
+            const double chosen = (std::fabs(diff_b) < std::fabs(diff_a)) ? diff_b : diff_a;
+            if (std::fabs(chosen) > imu_auto_offset_threshold_)
+                offset_sec += chosen;
+        }
+
+        const double t_start_ros = t_min_sec + offset_sec;
+        const double t_end_ros = t_max_sec + offset_sec;
+        if (!(t_end_ros > t_start_ros))
+            return false;
+
+        const int K = std::max(2, imu_table_size_);
+        struct Q4
+        {
+            double w, x, y, z;
+        };
+        std::vector<Q4> qrel_table((size_t)K);
+
+        // 3) 构建相对旋转表：q_rel(t) 把点从 t 时刻坐标系旋回到 scan start
+        std::vector<Eigen::Quaterniond> q_abs((size_t)K);
+        for (int i = 0; i < K; ++i)
+        {
+            const double alpha = (K == 1) ? 0.0 : (double)i / (double)(K - 1);
+            const double t_query = t_start_ros + (t_end_ros - t_start_ros) * alpha;
+
+            Eigen::Quaterniond q;
+            if (!getImuQuatAt(t_query, q))
+            {
+                ROS_WARN_THROTTLE(1.0,
+                                  "IMU deskew failed: imu buffer not covering [%.6f, %.6f], query=%.6f",
+                                  t_start_ros, t_end_ros, t_query);
+                return false;
+            }
+            q_abs[(size_t)i] = q;
+        }
+
+        const Eigen::Quaterniond q0 = q_abs[0];
+        const Eigen::Quaterniond qli = q_imu_to_lidar_;
+        const Eigen::Quaterniond qli_inv = qli.conjugate();
+
+        for (int i = 0; i < K; ++i)
+        {
+            Eigen::Quaterniond q_rel_imu;
+            if (imu_rel_mode_ == 0)
+                q_rel_imu = q0.conjugate() * q_abs[(size_t)i]; // q0^{-1} * q(t)
+            else
+                q_rel_imu = q0 * q_abs[(size_t)i].conjugate(); // q0 * q(t)^{-1}
+
+            Eigen::Quaterniond q_rel_lidar = qli * q_rel_imu * qli_inv;
+            q_rel_lidar.normalize();
+
+            qrel_table[(size_t)i] = Q4{q_rel_lidar.w(), q_rel_lidar.x(), q_rel_lidar.y(), q_rel_lidar.z()};
+        }
+
+        // 4) 逐点 deskew：查表得到 q_rel，再旋转点
+        const float nan_f = std::numeric_limits<float>::quiet_NaN();
+        size_t nan_written = 0;
+
+        for (size_t idx = 0; idx < num_points; ++idx)
+        {
+            uint8_t *p = base_ptr + idx * point_step;
+
+            float xf, yf, zf;
+            std::memcpy(&xf, p + offset_x, sizeof(float));
+            std::memcpy(&yf, p + offset_y, sizeof(float));
+            std::memcpy(&zf, p + offset_z, sizeof(float));
+
+            if (!std::isfinite(xf) || !std::isfinite(yf) || !std::isfinite(zf) ||
+                (std::fabs(xf) + std::fabs(yf) + std::fabs(zf) < eps_l1) ||
+                (xf * xf + yf * yf + zf * zf < min_range2))
+            {
+                std::memcpy(p + offset_x, &nan_f, sizeof(float));
+                std::memcpy(p + offset_y, &nan_f, sizeof(float));
+                std::memcpy(p + offset_z, &nan_f, sizeof(float));
+                ++nan_written;
+                continue;
+            }
+
+            double ts;
+            std::memcpy(&ts, p + offset_ts, sizeof(double));
+            if (!std::isfinite(ts))
+            {
+                std::memcpy(p + offset_x, &nan_f, sizeof(float));
+                std::memcpy(p + offset_y, &nan_f, sizeof(float));
+                std::memcpy(p + offset_z, &nan_f, sizeof(float));
+                ++nan_written;
+                continue;
+            }
+
+            double s = (ts - ts_min) / ts_span;
+            if (s < 0.0)
+                s = 0.0;
+            if (s > 1.0)
+                s = 1.0;
+
+            const double u = s * (double)(K - 1);
+            int i0 = (int)std::floor(u);
+            if (i0 < 0)
+                i0 = 0;
+            if (i0 > K - 1)
+                i0 = K - 1;
+
+            double w, qx, qy, qz;
+
+            if (imu_table_interp_ && i0 < K - 1)
+            {
+                const int i1 = i0 + 1;
+                const double r = u - (double)i0;
+
+                Q4 a = qrel_table[(size_t)i0];
+                Q4 b = qrel_table[(size_t)i1];
+
+                // 确保走最短弧（nlerp）
+                const double dot = a.w * b.w + a.x * b.x + a.y * b.y + a.z * b.z;
+                if (dot < 0.0)
+                {
+                    b.w = -b.w;
+                    b.x = -b.x;
+                    b.y = -b.y;
+                    b.z = -b.z;
+                }
+
+                w = (1.0 - r) * a.w + r * b.w;
+                qx = (1.0 - r) * a.x + r * b.x;
+                qy = (1.0 - r) * a.y + r * b.y;
+                qz = (1.0 - r) * a.z + r * b.z;
+
+                const double n = std::sqrt(w * w + qx * qx + qy * qy + qz * qz);
+                if (n > 1e-12)
+                {
+                    w /= n;
+                    qx /= n;
+                    qy /= n;
+                    qz /= n;
+                }
+            }
+            else
+            {
+                int ii = (int)std::llround(u);
+                if (ii < 0)
+                    ii = 0;
+                if (ii > K - 1)
+                    ii = K - 1;
+                const Q4 q = qrel_table[(size_t)ii];
+                w = q.w;
+                qx = q.x;
+                qy = q.y;
+                qz = q.z;
+            }
+
+            // 旋转：p_out = q_rel * p
+            const double vx = (double)xf;
+            const double vy = (double)yf;
+            const double vz = (double)zf;
+
+            // t = 2 * cross(q_vec, v)
+            const double tx2 = 2.0 * (qy * vz - qz * vy);
+            const double ty2 = 2.0 * (qz * vx - qx * vz);
+            const double tz2 = 2.0 * (qx * vy - qy * vx);
+
+            // v' = v + w*t + cross(q_vec, t)
+            const double vpx = vx + w * tx2 + (qy * tz2 - qz * ty2);
+            const double vpy = vy + w * ty2 + (qz * tx2 - qx * tz2);
+            const double vpz = vz + w * tz2 + (qx * ty2 - qy * tx2);
+
+            const float xo = (float)vpx;
+            const float yo = (float)vpy;
+            const float zo = (float)vpz;
+
+            std::memcpy(p + offset_x, &xo, sizeof(float));
+            std::memcpy(p + offset_y, &yo, sizeof(float));
+            std::memcpy(p + offset_z, &zo, sizeof(float));
+        }
+
+        auto t1 = std::chrono::high_resolution_clock::now();
+        t_deskew_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        ROS_INFO("[Frame %d] deskew(current,IMU-rot): points=%zu nan_written=%zu ts_span=%.6f imu_offset=%.6f time=%.3f ms",
+                 frame_idx_, num_points, nan_written, ts_span, offset_sec, t_deskew_ms);
+
+        return true;
+    }
+
+// ---------- 点云畸变矫正：使用每点 timestamp + Tguess（匀速模型） ----------
+    // 说明：
+    //  - 需要 PointCloud2 中存在字段：x/y/z/timestamp（timestamp 为 float64）
+    //  - 使用 Tguess (R_end, t_end) 近似一帧扫描周期内的 start->end 运动
+    //  - 对每个点根据 s = (ts - ts_min) / (ts_max - ts_min) 插值得到局部运动，再把点补偿回 scan start
+    //
+    // deskew 输出将原地修改 cloud.data 内的 x/y/z（其他字段保持不变）
+    bool deskewPointCloudInPlaceTimestamp(sensor_msgs::PointCloud2 &cloud,
+                                          const cv::Mat &R_end_in,
+                                          const cv::Mat &t_end_in,
+                                          double &t_deskew_ms)
+    {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        t_deskew_ms = 0.0;
+
+        if (!enable_deskew_current_)
+            return false;
+
+        const size_t num_points = (size_t)cloud.width * cloud.height;
+        if (num_points == 0 || cloud.data.empty())
+            return false;
+
+        // 找字段 offset（注意：AT128 的 point_step 可能不是 4/8 对齐，必须用 memcpy 读写）
+        int offset_x = -1, offset_y = -1, offset_z = -1, offset_ts = -1;
+        int dtype_ts = -1;
+        for (const auto &f : cloud.fields)
+        {
+            if (f.name == "x")
+                offset_x = f.offset;
+            else if (f.name == "y")
+                offset_y = f.offset;
+            else if (f.name == "z")
+                offset_z = f.offset;
+            else if (f.name == "timestamp")
+            {
+                offset_ts = f.offset;
+                dtype_ts = f.datatype;
+            }
+        }
+        if (offset_x < 0 || offset_y < 0 || offset_z < 0 || offset_ts < 0)
+        {
+            ROS_WARN_THROTTLE(1.0, "deskew disabled: missing x/y/z/timestamp field.");
+            return false;
+        }
+        if (dtype_ts != sensor_msgs::PointField::FLOAT64)
+        {
+            ROS_WARN_THROTTLE(1.0, "deskew disabled: timestamp datatype is not FLOAT64 (datatype=%d).", dtype_ts);
+            return false;
+        }
+
+        const size_t point_step = cloud.point_step;
+        if ((size_t)offset_x + sizeof(float) > point_step ||
+            (size_t)offset_y + sizeof(float) > point_step ||
+            (size_t)offset_z + sizeof(float) > point_step ||
+            (size_t)offset_ts + sizeof(double) > point_step)
+        {
+            ROS_ERROR("deskewPointCloudInPlaceTimestamp: field offsets exceed point_step (point_step=%zu).", point_step);
+            return false;
+        }
+
+        uint8_t *base_ptr = cloud.data.data();
+
+        // 1) 统计当前帧 timestamp 范围（忽略无效点）
+        double ts_min = std::numeric_limits<double>::infinity();
+        double ts_max = -std::numeric_limits<double>::infinity();
+        size_t valid_for_span = 0;
+
+        const float min_range2 = deskew_min_range_ * deskew_min_range_;
+        const float eps_l1 = deskew_placeholder_eps_;
+
+        for (size_t idx = 0; idx < num_points; ++idx)
+        {
+            const uint8_t *p = base_ptr + idx * point_step;
+
+            float x, y, z;
+            std::memcpy(&x, p + offset_x, sizeof(float));
+            std::memcpy(&y, p + offset_y, sizeof(float));
+            std::memcpy(&z, p + offset_z, sizeof(float));
+
+            if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
+                continue;
+            if (std::fabs(x) + std::fabs(y) + std::fabs(z) < eps_l1)
+                continue;
+            const float r2 = x * x + y * y + z * z;
+            if (r2 < min_range2)
+                continue;
+
+            double ts;
+            std::memcpy(&ts, p + offset_ts, sizeof(double));
+            if (!std::isfinite(ts))
+                continue;
+
+            ts_min = std::min(ts_min, ts);
+            ts_max = std::max(ts_max, ts);
+            ++valid_for_span;
+        }
+
+        if (valid_for_span < 50 || !(ts_max > ts_min))
+        {
+            ROS_WARN_THROTTLE(1.0, "deskew disabled: bad timestamp span (valid=%zu, min=%.6f max=%.6f).",
+                              valid_for_span, ts_min, ts_max);
+            return false;
+        }
+        const double ts_span = ts_max - ts_min;
+
+        // 2) 预计算旋转 axis-angle（log(R_end)）
+        cv::Mat R_end = R_end_in;
+        cv::Mat t_end = t_end_in;
+        if (deskew_use_inverse_tguess_)
+        {
+            cv::Mat R_inv = R_end.t();
+            cv::Mat t_inv = -R_inv * t_end;
+            R_end = R_inv;
+            t_end = t_inv;
+        }
+
+        cv::Mat rvec_end;
+        cv::Rodrigues(R_end, rvec_end); // 3x1 (axis * angle)
+
+        const double rx = rvec_end.at<double>(0);
+        const double ry = rvec_end.at<double>(1);
+        const double rz = rvec_end.at<double>(2);
+        const double angle_end = std::sqrt(rx * rx + ry * ry + rz * rz);
+
+        double ax = 0.0, ay = 0.0, az = 0.0;
+        if (angle_end > 1e-12)
+        {
+            ax = rx / angle_end;
+            ay = ry / angle_end;
+            az = rz / angle_end;
+        }
+
+        const double tx = t_end.at<double>(0);
+        const double ty = t_end.at<double>(1);
+        const double tz = t_end.at<double>(2);
+
+        const float nan_f = std::numeric_limits<float>::quiet_NaN();
+        size_t nan_written = 0;
+
+        // 3) 第二遍：逐点 deskew
+        for (size_t idx = 0; idx < num_points; ++idx)
+        {
+            uint8_t *p = base_ptr + idx * point_step;
+
+            float xf, yf, zf;
+            std::memcpy(&xf, p + offset_x, sizeof(float));
+            std::memcpy(&yf, p + offset_y, sizeof(float));
+            std::memcpy(&zf, p + offset_z, sizeof(float));
+
+            if (!std::isfinite(xf) || !std::isfinite(yf) || !std::isfinite(zf) ||
+                (std::fabs(xf) + std::fabs(yf) + std::fabs(zf) < eps_l1) ||
+                (xf * xf + yf * yf + zf * zf < min_range2))
+            {
+                // 无效/占位点：写 NaN，避免 deskew 后形成“原点射线”
+                std::memcpy(p + offset_x, &nan_f, sizeof(float));
+                std::memcpy(p + offset_y, &nan_f, sizeof(float));
+                std::memcpy(p + offset_z, &nan_f, sizeof(float));
+                ++nan_written;
+                continue;
+            }
+
+            double ts;
+            std::memcpy(&ts, p + offset_ts, sizeof(double));
+            if (!std::isfinite(ts))
+            {
+                std::memcpy(p + offset_x, &nan_f, sizeof(float));
+                std::memcpy(p + offset_y, &nan_f, sizeof(float));
+                std::memcpy(p + offset_z, &nan_f, sizeof(float));
+                ++nan_written;
+                continue;
+            }
+
+            double s = (ts - ts_min) / ts_span;
+            if (s < 0.0)
+                s = 0.0;
+            if (s > 1.0)
+                s = 1.0;
+
+            // 平移插值：t(s) = s * t_end
+            const double tsx = s * tx;
+            const double tsy = s * ty;
+            const double tsz = s * tz;
+
+            // 旋转插值：R(s) = Exp(s * log(R_end))，用 axis-angle -> quaternion
+            double w = 1.0, qx = 0.0, qy = 0.0, qz = 0.0;
+            if (angle_end > 1e-12)
+            {
+                const double half = 0.5 * (s * angle_end);
+                const double sh = std::sin(half);
+                w = std::cos(half);
+                qx = ax * sh;
+                qy = ay * sh;
+                qz = az * sh;
+            }
+
+            // 先减平移：v = p - t(s)
+            double vx = (double)xf - tsx;
+            double vy = (double)yf - tsy;
+            double vz = (double)zf - tsz;
+
+            // deskew 到 scan start：p_start = R(s)^T * (p - t(s))
+            // 即 v_rot = q_conj * v * q，其中 q_conj = (w, -qx, -qy, -qz)
+            const double cx = -qx, cy = -qy, cz = -qz;
+
+            // t = 2 * cross(c, v)
+            const double tx2 = 2.0 * (cy * vz - cz * vy);
+            const double ty2 = 2.0 * (cz * vx - cx * vz);
+            const double tz2 = 2.0 * (cx * vy - cy * vx);
+
+            // v' = v + w*t + cross(c, t)
+            const double vpx = vx + w * tx2 + (cy * tz2 - cz * ty2);
+            const double vpy = vy + w * ty2 + (cz * tx2 - cx * tz2);
+            const double vpz = vz + w * tz2 + (cx * ty2 - cy * tx2);
+
+            float xo = (float)vpx;
+            float yo = (float)vpy;
+            float zo = (float)vpz;
+
+            std::memcpy(p + offset_x, &xo, sizeof(float));
+            std::memcpy(p + offset_y, &yo, sizeof(float));
+            std::memcpy(p + offset_z, &zo, sizeof(float));
+        }
+
+        auto t1 = std::chrono::high_resolution_clock::now();
+        t_deskew_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        ROS_INFO("[Frame %d] deskew(current,Tguess): points=%zu nan_written=%zu span=%.6f time=%.3f ms",
+                 frame_idx_, num_points, nan_written, ts_span, t_deskew_ms);
+
+        return true;
+    }
+
+
+    // ---------- 投影模式 1：angle（az + el） ----------
+    void buildIntensityImageAngle(
+        const sensor_msgs::PointCloud2 &cloud,
+        cv::Mat &intensity_f,
+        std::vector<float> &pixel_x,
+        std::vector<float> &pixel_y,
+        std::vector<float> &pixel_z,
+        std::vector<char> &has_point,
+        double &t_offset_ms,
+        double &t_project_ms,
+        double &t_merge_ms)
+    {
+        auto t_off_start = std::chrono::high_resolution_clock::now();
+
+        const size_t num_points = (size_t)cloud.width * cloud.height;
+        if (num_points == 0)
+        {
+            t_offset_ms = t_project_ms = t_merge_ms = 0.0;
+            intensity_f.release();
+            pixel_x.clear();
+            pixel_y.clear();
+            pixel_z.clear();
+            has_point.clear();
+            return;
+        }
+
+        int offset_x = -1, offset_y = -1, offset_z = -1, offset_i = -1;
+        for (const auto &f : cloud.fields)
+        {
+            if (f.name == "x")
+                offset_x = f.offset;
+            else if (f.name == "y")
+                offset_y = f.offset;
+            else if (f.name == "z")
+                offset_z = f.offset;
+            else if (f.name == "intensity")
+                offset_i = f.offset;
+        }
+
+        if (offset_x < 0 || offset_y < 0 || offset_z < 0 || offset_i < 0)
+        {
+            ROS_ERROR("buildIntensityImageAngle: x/y/z/intensity fields not all found.");
+            t_offset_ms = t_project_ms = t_merge_ms = 0.0;
+            intensity_f.release();
+            pixel_x.clear();
+            pixel_y.clear();
+            pixel_z.clear();
+            has_point.clear();
+            return;
+        }
+
+        const uint8_t *base_ptr = cloud.data.data();
+        const size_t point_step = cloud.point_step;
+
+        auto t_off_end = std::chrono::high_resolution_clock::now();
+        t_offset_ms = std::chrono::duration<double, std::milli>(t_off_end - t_off_start).count();
+
+        // ---- project ----
+        auto t_proj_start = std::chrono::high_resolution_clock::now();
+
+        const int v_res = v_res_;
+        const int h_res = h_res_;
+        const size_t total_pix = (size_t)v_res * h_res;
+
+        int omp_threads = 1;
+#ifdef _OPENMP
+        if (enable_parallel_projection_ && enable_multithread_ && num_threads_ > 1)
+            omp_threads = num_threads_;
+        else
+            omp_threads = 1;
+#endif
+
+        std::vector<std::vector<PixAcc>> thread_grids(
+            (size_t)omp_threads, std::vector<PixAcc>(total_pix));
+
+#ifdef _OPENMP
+#pragma omp parallel num_threads(omp_threads)
+#endif
+        {
+            int tid = 0;
+#ifdef _OPENMP
+            tid = omp_get_thread_num();
+#endif
+            auto &grid = thread_grids[(size_t)tid];
+
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+            for (int i = 0; i < (int)num_points; ++i)
+            {
+                if (sample_step_ > 1 && (i % sample_step_ != 0))
+                    continue;
+
+                const uint8_t *p_base = base_ptr + (size_t)i * point_step;
+                float x, y, z, intensity;
+                std::memcpy(&x, p_base + offset_x, sizeof(float));
+                std::memcpy(&y, p_base + offset_y, sizeof(float));
+                std::memcpy(&z, p_base + offset_z, sizeof(float));
+                std::memcpy(&intensity, p_base + offset_i, sizeof(float));
+
+                if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) ||
+                    !std::isfinite(intensity) || intensity <= 0.0f)
+                {
+                    continue;
+                }
+
+                double az = std::atan2((double)y, (double)x);
+                double r_xy = std::sqrt((double)x * x + (double)y * y);
+                double el = std::atan2((double)z, r_xy);
+
+                if (az < min_az_ || az > max_az_ || el < min_el_ || el > max_el_)
+                    continue;
+
+                double uf = (az - min_az_) / (max_az_ - min_az_) * (h_res - 1);
+                double vf = (max_el_ - el) / (max_el_ - min_el_) * (v_res - 1);
+
+                int u = (int)std::round(uf);
+                int v = (int)std::round(vf);
+                if (u < 0 || u >= h_res || v < 0 || v >= v_res)
+                    continue;
+
+                size_t pid = (size_t)v * h_res + (size_t)u;
+                PixAcc &cell = grid[pid];
+
+                if (!cell.has_point || intensity > cell.max_intensity)
+                {
+                    cell.max_intensity = intensity;
+                    cell.x = x;
+                    cell.y = y;
+                    cell.z = z;
+                    cell.has_point = true;
+                }
+            }
+        }
+
+        auto t_proj_end = std::chrono::high_resolution_clock::now();
+        t_project_ms = std::chrono::duration<double, std::milli>(t_proj_end - t_proj_start).count();
+
+        // ---- merge ----
+        auto t_merge_start = std::chrono::high_resolution_clock::now();
+
+        std::vector<PixAcc> global_grid(total_pix);
+        for (int t = 0; t < omp_threads; ++t)
+        {
+            const auto &g = thread_grids[(size_t)t];
+            for (size_t pid = 0; pid < total_pix; ++pid)
+            {
+                const PixAcc &src = g[pid];
+                PixAcc &dst = global_grid[pid];
+                if (src.has_point && (!dst.has_point || src.max_intensity > dst.max_intensity))
+                    dst = src;
+            }
+        }
+
+        auto t_merge_end = std::chrono::high_resolution_clock::now();
+        t_merge_ms = std::chrono::duration<double, std::milli>(t_merge_end - t_merge_start).count();
+
+        // ---- output ----
+        intensity_f = cv::Mat(v_res, h_res, CV_32F, cv::Scalar(0.0f));
+        pixel_x.assign(total_pix, 0.0f);
+        pixel_y.assign(total_pix, 0.0f);
+        pixel_z.assign(total_pix, 0.0f);
+        has_point.assign(total_pix, 0);
+
+        for (size_t pid = 0; pid < total_pix; ++pid)
+        {
+            const PixAcc &cell = global_grid[pid];
+            if (!cell.has_point)
+                continue;
+            int v = (int)(pid / h_res);
+            int u = (int)(pid % h_res);
+
+            intensity_f.at<float>(v, u) = cell.max_intensity;
+            pixel_x[pid] = cell.x;
+            pixel_y[pid] = cell.y;
+            pixel_z[pid] = cell.z;
+            has_point[pid] = 1;
+        }
+    }
+
+    // ---------- 投影模式 2：ring + azimuth ----------
+    void buildIntensityImageRing(
+        const sensor_msgs::PointCloud2 &cloud,
+        cv::Mat &intensity_f,
+        std::vector<float> &pixel_x,
+        std::vector<float> &pixel_y,
+        std::vector<float> &pixel_z,
+        std::vector<char> &has_point,
+        double &t_offset_ms,
+        double &t_project_ms,
+        double &t_merge_ms)
+    {
+        auto t_off_start = std::chrono::high_resolution_clock::now();
+
+        const size_t num_points = (size_t)cloud.width * cloud.height;
+        if (num_points == 0)
+        {
+            t_offset_ms = t_project_ms = t_merge_ms = 0.0;
+            intensity_f.release();
+            pixel_x.clear();
+            pixel_y.clear();
+            pixel_z.clear();
+            has_point.clear();
+            return;
+        }
+
+        int offset_x = -1, offset_y = -1, offset_z = -1, offset_i = -1, offset_ring = -1;
+        int ring_datatype = -1;
+
+        for (const auto &f : cloud.fields)
+        {
+            if (f.name == "x")
+                offset_x = f.offset;
+            else if (f.name == "y")
+                offset_y = f.offset;
+            else if (f.name == "z")
+                offset_z = f.offset;
+            else if (f.name == "intensity")
+                offset_i = f.offset;
+            else if (f.name == "ring")
+            {
+                offset_ring = f.offset;
+                ring_datatype = f.datatype;
+            }
+        }
+
+        if (offset_x < 0 || offset_y < 0 || offset_z < 0 || offset_i < 0 || offset_ring < 0)
+        {
+            ROS_ERROR("buildIntensityImageRing: x/y/z/intensity/ring fields not all found.");
+            t_offset_ms = t_project_ms = t_merge_ms = 0.0;
+            intensity_f.release();
+            pixel_x.clear();
+            pixel_y.clear();
+            pixel_z.clear();
+            has_point.clear();
+            return;
+        }
+
+        const uint8_t *base_ptr = cloud.data.data();
+        const size_t point_step = cloud.point_step;
+
+        auto t_off_end = std::chrono::high_resolution_clock::now();
+        t_offset_ms = std::chrono::duration<double, std::milli>(t_off_end - t_off_start).count();
+
+        // ---- project ----
+        auto t_proj_start = std::chrono::high_resolution_clock::now();
+
+        const int v_res = v_res_;
+        const int h_res = h_res_;
+        const size_t total_pix = (size_t)v_res * h_res;
+
+        int omp_threads = 1;
+#ifdef _OPENMP
+        if (enable_parallel_projection_ && enable_multithread_ && num_threads_ > 1)
+            omp_threads = num_threads_;
+        else
+            omp_threads = 1;
+#endif
+
+        std::vector<std::vector<PixAcc>> thread_grids(
+            (size_t)omp_threads, std::vector<PixAcc>(total_pix));
+
+#ifdef _OPENMP
+#pragma omp parallel num_threads(omp_threads)
+#endif
+        {
+            int tid = 0;
+#ifdef _OPENMP
+            tid = omp_get_thread_num();
+#endif
+            auto &grid = thread_grids[(size_t)tid];
+
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+            for (int i = 0; i < (int)num_points; ++i)
+            {
+                if (sample_step_ > 1 && (i % sample_step_ != 0))
+                    continue;
+
+                const uint8_t *p_base = base_ptr + (size_t)i * point_step;
+
+                int ring = 0;
+                if (ring_datatype == sensor_msgs::PointField::UINT16)
+                {
+                    const uint16_t *pr = reinterpret_cast<const uint16_t *>(p_base + offset_ring);
+                    ring = (int)(*pr);
+                }
+                else if (ring_datatype == sensor_msgs::PointField::INT16)
+                {
+                    const int16_t *pr = reinterpret_cast<const int16_t *>(p_base + offset_ring);
+                    ring = (int)(*pr);
+                }
+                else
+                {
+                    const uint16_t *pr = reinterpret_cast<const uint16_t *>(p_base + offset_ring);
+                    ring = (int)(*pr);
+                }
+
+                if (ring < 0 || ring >= v_res)
+                    continue;
+
+                float x, y, z, intensity;
+                std::memcpy(&x, p_base + offset_x, sizeof(float));
+                std::memcpy(&y, p_base + offset_y, sizeof(float));
+                std::memcpy(&z, p_base + offset_z, sizeof(float));
+                std::memcpy(&intensity, p_base + offset_i, sizeof(float));
+
+                if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) ||
+                    !std::isfinite(intensity) || intensity <= 0.0f)
+                {
+                    continue;
+                }
+
+                double az = std::atan2((double)y, (double)x);
+                if (az < min_az_ || az > max_az_)
+                    continue;
+
+                double uf = (az - min_az_) / (max_az_ - min_az_) * (h_res - 1);
+                int u = (int)std::round(uf);
+                int v = ring; // 行 = ring
+
+                if (u < 0 || u >= h_res || v < 0 || v >= v_res)
+                    continue;
+
+                size_t pid = (size_t)v * h_res + (size_t)u;
+                PixAcc &cell = grid[pid];
+
+                if (!cell.has_point || intensity > cell.max_intensity)
+                {
+                    cell.max_intensity = intensity;
+                    cell.x = x;
+                    cell.y = y;
+                    cell.z = z;
+                    cell.has_point = true;
+                }
+            }
+        }
+
+        auto t_proj_end = std::chrono::high_resolution_clock::now();
+        t_project_ms = std::chrono::duration<double, std::milli>(t_proj_end - t_proj_start).count();
+
+        // ---- merge ----
+        auto t_merge_start = std::chrono::high_resolution_clock::now();
+
+        std::vector<PixAcc> global_grid(total_pix);
+        for (int t = 0; t < omp_threads; ++t)
+        {
+            const auto &g = thread_grids[(size_t)t];
+            for (size_t pid = 0; pid < total_pix; ++pid)
+            {
+                const PixAcc &src = g[pid];
+                PixAcc &dst = global_grid[pid];
+                if (src.has_point && (!dst.has_point || src.max_intensity > dst.max_intensity))
+                    dst = src;
+            }
+        }
+
+        auto t_merge_end = std::chrono::high_resolution_clock::now();
+        t_merge_ms = std::chrono::duration<double, std::milli>(t_merge_end - t_merge_start).count();
+
+        // ---- output ----
+        intensity_f = cv::Mat(v_res, h_res, CV_32F, cv::Scalar(0.0f));
+        pixel_x.assign(total_pix, 0.0f);
+        pixel_y.assign(total_pix, 0.0f);
+        pixel_z.assign(total_pix, 0.0f);
+        has_point.assign(total_pix, 0);
+
+        for (size_t pid = 0; pid < total_pix; ++pid)
+        {
+            const PixAcc &cell = global_grid[pid];
+            if (!cell.has_point)
+                continue;
+            int v = (int)(pid / h_res);
+            int u = (int)(pid % h_res);
+
+            intensity_f.at<float>(v, u) = cell.max_intensity;
+            pixel_x[pid] = cell.x;
+            pixel_y[pid] = cell.y;
+            pixel_z[pid] = cell.z;
+            has_point[pid] = 1;
+        }
+    }
+
+    // ---------- 回调 ----------
+    void callback(const sensor_msgs::PointCloud2ConstPtr &msg)
+    {
+        if (!msg || msg->data.empty())
+            return;
+
+        auto t_total_start = std::chrono::high_resolution_clock::now();
+
+        // 0) 线束采样（只用于发布，不用于投影）
+        double t_sample_ms = 0.0;
+        sensor_msgs::PointCloud2 sampled_cloud;
+
+        // 0.1) 当前帧 Tguess（由图像匹配得到），用于对“当前帧”做匀速 deskew（预测式）
+        bool got_tguess = false;
+        cv::Mat Rfit_this, tfit_this; // prev->cur
+        double t_deskew_ms = 0.0;
+        double t_imu_deskew_ms = 0.0;
+
+        // ---------- 1) 投影：始终使用原始点云 msg ----------
+        double t_off_ms = 0.0, t_proj_inner_ms = 0.0, t_merge_ms = 0.0, t_norm_ms = 0.0;
+
+        auto t_proj_start = std::chrono::high_resolution_clock::now();
+
+        cv::Mat intensity_f;
+        std::vector<float> pixel_x, pixel_y, pixel_z;
+        std::vector<char> has_point;
+
+        if (projection_mode_ == "ring")
+        {
+            buildIntensityImageRing(*msg,
+                                    intensity_f,
+                                    pixel_x, pixel_y, pixel_z, has_point,
+                                    t_off_ms, t_proj_inner_ms, t_merge_ms);
+        }
+        else
+        {
+            buildIntensityImageAngle(*msg,
+                                     intensity_f,
+                                     pixel_x, pixel_y, pixel_z, has_point,
+                                     t_off_ms, t_proj_inner_ms, t_merge_ms);
+        }
+
+        cv::Mat intensity_raw_8u;
+        auto t_norm_start = std::chrono::high_resolution_clock::now();
+        if (!intensity_f.empty())
+        {
+            cv::normalize(intensity_f, intensity_raw_8u, 0, 255, cv::NORM_MINMAX, CV_8U);
+            std::string raw_path = output_dir_ + "/intensity_raw_" + std::to_string(frame_idx_) + ".png";
+            // cv::imwrite(raw_path, intensity_raw_8u);
+        }
+        auto t_norm_end = std::chrono::high_resolution_clock::now();
+        t_norm_ms = std::chrono::duration<double, std::milli>(t_norm_end - t_norm_start).count();
+
+        auto t_proj_end = std::chrono::high_resolution_clock::now();
+        double t_proj_ms = std::chrono::duration<double, std::milli>(t_proj_end - t_proj_start).count();
+
+        ROS_INFO("[Frame %d] Projection(%s) breakdown (ms): offset=%.3f project=%.3f merge=%.3f normalize=%.3f total=%.3f",
+                 frame_idx_, projection_mode_.c_str(),
+                 t_off_ms, t_proj_inner_ms, t_merge_ms, t_norm_ms, t_proj_ms);
+
+        // ---------- 2) 图像增强 ----------
+        auto t_enh_start = std::chrono::high_resolution_clock::now();
+
+        cv::Mat intensity_enh = intensity_raw_8u.clone();
+        if (contrast_mode_ == "clahe")
+        {
+            cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(3.0, cv::Size(8, 8));
+            clahe->apply(intensity_raw_8u, intensity_enh);
+        }
+        else if (contrast_mode_ == "equalize")
+        {
+            cv::equalizeHist(intensity_raw_8u, intensity_enh);
+        }
+        if (enable_blur_)
+        {
+            cv::GaussianBlur(intensity_enh, intensity_enh, cv::Size(3, 3), 0);
+        }
+
+        std::string enh_path = output_dir_ + "/intensity_enh_" + std::to_string(frame_idx_) + ".png";
+        // cv::imwrite(enh_path, intensity_enh);
+
+        auto t_enh_end = std::chrono::high_resolution_clock::now();
+        double t_enh_ms = std::chrono::duration<double, std::milli>(t_enh_end - t_enh_start).count();
+
+        // ---------- 3) ORB ----------
+        auto t_orb_start = std::chrono::high_resolution_clock::now();
+
+        cv::Ptr<cv::ORB> orb = cv::ORB::create(orb_nfeatures_, (float)orb_scaleFactor_, orb_nlevels_,
+                                               orb_edgeThreshold_, 0, orb_wta_k_, orb_score_type_,
+                                               orb_patchSize_, orb_fastThreshold_);
+        std::vector<cv::KeyPoint> keypoints;
+        cv::Mat descriptors;
+        orb->detectAndCompute(intensity_enh, cv::noArray(), keypoints, descriptors);
+
+        cv::Mat orb_vis;
+        cv::cvtColor(intensity_enh, orb_vis, cv::COLOR_GRAY2BGR);
+        for (const auto &kp : keypoints)
+        {
+            cv::circle(orb_vis, kp.pt, orb_vis_radius_, cv::Scalar(0, 255, 0), -1);
+        }
+        // cv::imwrite(output_dir_ + "/orb_vis_" + std::to_string(frame_idx_) + ".png", orb_vis);
+
+        auto t_orb_end = std::chrono::high_resolution_clock::now();
+        double t_orb_ms = std::chrono::duration<double, std::milli>(t_orb_end - t_orb_start).count();
+
+        // ---------- 4) 匹配 + RANSAC ----------
+        double t_match_ms = 0.0, t_ransac2d_ms = 0.0, t_ransac3d_ms = 0.0;
+        size_t count_2d_inliers = 0, count_3d_inliers = 0;
+
+        if (has_prev_frame_ && !descriptors.empty() && !prev_desc_.empty())
+        {
+            auto t_match_start = std::chrono::high_resolution_clock::now();
+
+            cv::BFMatcher matcher(cv::NORM_HAMMING);
+            std::vector<std::vector<cv::DMatch>> knn_matches;
+            matcher.knnMatch(prev_desc_, descriptors, knn_matches, 2);
+
+            std::vector<cv::DMatch> ratio_pass;
+            ratio_pass.reserve(knn_matches.size());
+            for (const auto &m : knn_matches)
+            {
+                if (m.size() >= 2 && m[0].distance < ratio_thresh_ * m[1].distance)
+                    ratio_pass.push_back(m[0]);
+            }
+
+            std::vector<cv::DMatch> dist_pass;
+            dist_pass.reserve(ratio_pass.size());
+            for (const auto &m : ratio_pass)
+            {
+                if (m.distance <= hamming_thresh_)
+                    dist_pass.push_back(m);
+            }
+
+            auto t_match_end1 = std::chrono::high_resolution_clock::now();
+            t_match_ms = std::chrono::duration<double, std::milli>(t_match_end1 - t_match_start).count();
+
+            std::vector<cv::Point2f> pts_prev, pts_cur;
+            pts_prev.reserve(dist_pass.size());
+            pts_cur.reserve(dist_pass.size());
+            for (const auto &m : dist_pass)
+            {
+                pts_prev.push_back(prev_kp_[m.queryIdx].pt);
+                pts_cur.push_back(keypoints[m.trainIdx].pt);
+            }
+
+            std::vector<cv::DMatch> matches_2d_inliers;
+
+            if (enable_ransac_2d_ && pts_prev.size() >= 8)
+            {
+                auto t_r2_start = std::chrono::high_resolution_clock::now();
+
+                std::vector<uchar> mask2d;
+                cv::Mat H = cv::findHomography(pts_prev, pts_cur,
+                                               cv::RANSAC,
+                                               ransac_2d_reproj_,
+                                               mask2d);
+                (void)H;
+
+                matches_2d_inliers.reserve(dist_pass.size());
+                for (size_t i = 0; i < dist_pass.size(); ++i)
+                {
+                    if (i < mask2d.size() && mask2d[i])
+                        matches_2d_inliers.push_back(dist_pass[i]);
+                }
+
+                auto t_r2_end = std::chrono::high_resolution_clock::now();
+                t_ransac2d_ms = std::chrono::duration<double, std::milli>(t_r2_end - t_r2_start).count();
+            }
+            else
+            {
+                matches_2d_inliers = dist_pass;
+                t_ransac2d_ms = 0.0;
+            }
+
+            count_2d_inliers = matches_2d_inliers.size();
+
+            std::string vis2d_path = output_dir_ + "/match_2d_" + std::to_string(frame_idx_) + ".png";
+            // visualizeMatchesStacked(prev_img_, intensity_enh, prev_kp_, keypoints, matches_2d_inliers, vis2d_path);
+            ROS_INFO("Saved 2D visualization: %s (inliers=%zu)", vis2d_path.c_str(), matches_2d_inliers.size());
+
+            std::vector<cv::Point3f> P_all, Q_all;
+            std::vector<cv::DMatch> matches_for_3d;
+            P_all.reserve(matches_2d_inliers.size());
+            Q_all.reserve(matches_2d_inliers.size());
+
+            for (const auto &m : matches_2d_inliers)
+            {
+                int u1 = clampValue((int)std::round(prev_kp_[m.queryIdx].pt.x), 0, h_res_ - 1);
+                int v1 = clampValue((int)std::round(prev_kp_[m.queryIdx].pt.y), 0, v_res_ - 1);
+                int id1 = v1 * h_res_ + u1;
+
+                int u2 = clampValue((int)std::round(keypoints[m.trainIdx].pt.x), 0, h_res_ - 1);
+                int v2 = clampValue((int)std::round(keypoints[m.trainIdx].pt.y), 0, v_res_ - 1);
+                int id2 = v2 * h_res_ + u2;
+
+                if (id1 >= 0 && id1 < (int)prev_px_.size() && id2 >= 0 && id2 < (int)pixel_x.size())
+                {
+                    if (prev_has_[id1] && has_point[id2])
+                    {
+                        P_all.emplace_back(prev_px_[id1], prev_py_[id1], prev_pz_[id1]);
+                        Q_all.emplace_back(pixel_x[id2], pixel_y[id2], pixel_z[id2]);
+                        matches_for_3d.push_back(m);
+                    }
+                }
+            }
+
+            if (P_all.size() < 3)
+            {
+                ROS_WARN("Frame %d: not enough 3D correspondences after 2D filtering: %zu",
+                         frame_idx_, P_all.size());
+                std::ofstream ofs(output_dir_ + "/matches_3d_" + std::to_string(frame_idx_) + ".txt", std::ios::trunc);
+                ofs.close();
+            }
+            else
+            {
+                auto t_r3_start = std::chrono::high_resolution_clock::now();
+                std::vector<int> inlier_idx;
+                if (enable_parallel_ransac3d_ && ransac3d_threads_ > 1)
+                    inlier_idx = ransac3D_parallel(P_all, Q_all, ransac_3d_thresh_, ransac_3d_iters_, ransac3d_threads_);
+                else
+                    inlier_idx = ransac3D(P_all, Q_all, ransac_3d_thresh_, ransac_3d_iters_);
+                auto t_r3_end = std::chrono::high_resolution_clock::now();
+                t_ransac3d_ms = std::chrono::duration<double, std::milli>(t_r3_end - t_r3_start).count();
+
+                count_3d_inliers = inlier_idx.size();
+
+                std::vector<cv::DMatch> matches_3d_inliers;
+                std::vector<cv::Point3f> P_in, Q_in;
+                std::ofstream ofs3d(output_dir_ + "/matches_3d_" + std::to_string(frame_idx_) + ".txt", std::ios::trunc);
+                for (int idx_in : inlier_idx)
+                {
+                    if (idx_in >= 0 && idx_in < (int)P_all.size())
+                    {
+                        P_in.push_back(P_all[(size_t)idx_in]);
+                        Q_in.push_back(Q_all[(size_t)idx_in]);
+                        matches_3d_inliers.push_back(matches_for_3d[(size_t)idx_in]);
+                        ofs3d << P_all[(size_t)idx_in].x << " " << P_all[(size_t)idx_in].y << " " << P_all[(size_t)idx_in].z << " "
+                              << Q_all[(size_t)idx_in].x << " " << Q_all[(size_t)idx_in].y << " " << Q_all[(size_t)idx_in].z << "\n";
+                    }
+                }
+                ofs3d.close();
+                ROS_INFO("Saved %zu 3D matches => %s",
+                         P_in.size(), (output_dir_ + "/matches_3d_" + std::to_string(frame_idx_) + ".txt").c_str());
+
+                std::string vis3d_path = output_dir_ + "/match_3d_" + std::to_string(frame_idx_) + ".png";
+                visualizeMatchesStacked(prev_img_, intensity_enh, prev_kp_, keypoints, matches_3d_inliers, vis3d_path);
+                ROS_INFO("Saved 3D visualization: %s (inliers=%zu)",
+                         vis3d_path.c_str(), matches_3d_inliers.size());
+
+                if (P_in.size() >= 3)
+                {
+                    cv::Mat Rfit, tfit;
+                    if (estimateRigidSVD(P_in, Q_in, Rfit, tfit))
+                    {
+                        // 保存本帧的 Tguess（prev->cur），用于当前帧 deskew
+                        got_tguess = true;
+                        Rfit_this = Rfit.clone();
+                        tfit_this = tfit.clone();
+                        cv::Mat R_inv = Rfit.t();
+                        cv::Mat t_inv = -R_inv * tfit;
+
+                        double roll = atan2(R_inv.at<double>(2, 1), R_inv.at<double>(2, 2));
+                        double pitch = atan2(-R_inv.at<double>(2, 0),
+                                             std::sqrt(R_inv.at<double>(2, 1) * R_inv.at<double>(2, 1) + R_inv.at<double>(2, 2) * R_inv.at<double>(2, 2)));
+                        double yaw = atan2(R_inv.at<double>(1, 0), R_inv.at<double>(0, 0));
+
+                        double tx = t_inv.at<double>(0);
+                        double ty = t_inv.at<double>(1);
+                        double tz = t_inv.at<double>(2);
+
+                        std::ofstream fout(output_dir_ + "/all_Tguess.txt", std::ios::app);
+                        fout << frame_idx_ - 1 << " "
+                             << tx << " " << ty << " " << tz << " "
+                             << (roll * 180.0 / M_PI) << " "
+                             << (pitch * 180.0 / M_PI) << " "
+                             << (yaw * 180.0 / M_PI) << "\n";
+                        fout.close();
+
+                        ROS_INFO("Tguess frame %d->%d: tx=%.3f ty=%.3f tz=%.3f roll=%.2f pitch=%.2f yaw=%.2f deg",
+                                 frame_idx_ - 1, frame_idx_, tx, ty, tz,
+                                 roll * 180.0 / M_PI, pitch * 180.0 / M_PI, yaw * 180.0 / M_PI);
+                        if (tguess_pub_.getNumSubscribers() > 0)
+                        {
+                            nav_msgs::Odometry odom;
+                            odom.header.stamp = msg->header.stamp; // ★ 和当前帧点云同一个 stamp
+                            odom.header.frame_id = "tguess_odom";  // 父坐标系名字，自定义
+                            odom.child_frame_id = "tguess_lidar";  // 子坐标系名字，自定义
+
+                            // 位置
+                            odom.pose.pose.position.x = tx;
+                            odom.pose.pose.position.y = ty;
+                            odom.pose.pose.position.z = tz;
+
+                            // 姿态（roll/pitch/yaw 是弧度）
+                            tf::Quaternion q;
+                            q.setRPY(roll, pitch, yaw);
+                            odom.pose.pose.orientation.x = q.x();
+                            odom.pose.pose.orientation.y = q.y();
+                            odom.pose.pose.orientation.z = q.z();
+                            odom.pose.pose.orientation.w = q.w();
+
+                            // 协方差可以先给个比较大的值，表示只是“先验”
+                            for (int i = 0; i < 36; ++i)
+                            odom.pose.covariance[i] = 0.0;
+                            odom.pose.covariance[0] = 0.25;  // x
+                            odom.pose.covariance[7] = 0.25;  // y
+                            odom.pose.covariance[14] = 0.25; // z
+                            odom.pose.covariance[21] = 0.05; // roll
+                            odom.pose.covariance[28] = 0.05; // pitch
+                            odom.pose.covariance[35] = 0.05; // yaw
+                            std::cout<<"frame-Tguess_time:"<<frame_idx_<<"-"<<odom.header.stamp<<std::endl;
+                            tguess_pub_.publish(odom);
+                        }
+                    }
+                    else
+                    {
+                        ROS_WARN("estimateRigidSVD failed on final 3D inliers");
+                    }
+                }
+            }
+
+            auto t_match_end = std::chrono::high_resolution_clock::now();
+            t_match_ms = std::chrono::duration<double, std::milli>(t_match_end - t_match_start).count();
+        }
+        // ---------- 4.5) 对当前帧点云做 deskew（IMU 优先），再对 deskew 后点云做线束采样 ----------
+        sensor_msgs::PointCloud2 cloud_for_sampling = *msg; // 默认：原始当前帧
+
+        bool deskew_ok = false;
+        if (enable_imu_deskew_)
+        {
+            // IMU 旋转 deskew（推荐）
+            deskew_ok = deskewPointCloudInPlaceImuRotation(cloud_for_sampling, t_imu_deskew_ms);
+        }
+
+        if (!deskew_ok && imu_fallback_to_tguess_ && got_tguess && enable_deskew_current_)
+        {
+            // fallback：使用图像匹配得到的 Tguess 做匀速 deskew（预测式）
+            deskew_ok = deskewPointCloudInPlaceTimestamp(cloud_for_sampling, Rfit_this, tfit_this, t_deskew_ms);
+        }
+
+        if (enable_line_sampling_)
+        {
+            if (samplePointCloudByRing(cloud_for_sampling, sampled_cloud, t_sample_ms))
+            {
+                sampled_cloud.header = msg->header;
+                if (sampled_pub_.getNumSubscribers() > 0)
+                {
+                    sampled_pub_.publish(sampled_cloud);
+                }
+                std::cout << "frame-cloud_time:" << frame_idx_ << "-" << sampled_cloud.header.stamp << std::endl;
+            }
+        }
+
+        // ---------- 5) time_log ----------
+        auto t_total_end = std::chrono::high_resolution_clock::now();
+        double t_total_ms = std::chrono::duration<double, std::milli>(t_total_end - t_total_start).count();
+
+        {
+            std::ofstream tlog(output_dir_ + "/time_log.csv", std::ios::app);
+            tlog << frame_idx_ << "," << std::fixed << std::setprecision(3)
+                 << t_sample_ms << "," << t_proj_ms << "," << t_enh_ms << "," << t_orb_ms << ","
+                 << t_match_ms << "," << t_ransac2d_ms << "," << t_ransac3d_ms << "," << t_total_ms << "\n";
+            tlog.close();
+        }
+
+        ROS_INFO("[Frame %d] times(ms): sample=%.1f proj=%.1f enh=%.1f orb=%.1f match=%.1f r2d=%.1f r3d=%.1f total=%.1f",
+                 frame_idx_, t_sample_ms, t_proj_ms, t_enh_ms, t_orb_ms,
+                 t_match_ms, t_ransac2d_ms, t_ransac3d_ms, t_total_ms);
+        ROS_INFO("[Frame %d] matches: 2D_inliers=%zu 3D_inliers=%zu",
+                 frame_idx_, (size_t)count_2d_inliers, (size_t)count_3d_inliers);
+
+        // ---------- 6) 更新上一帧缓存 ----------
+        prev_img_ = intensity_enh.clone();
+        prev_desc_ = descriptors.clone();
+        prev_kp_ = keypoints;
+        prev_px_ = pixel_x;
+        prev_py_ = pixel_y;
+        prev_pz_ = pixel_z;
+        prev_has_ = has_point;
+        has_prev_frame_ = true;
+
+        frame_idx_++;
+    }
+};
+
+int main(int argc, char **argv)
+{
+    ros::init(argc, argv, "lidar_intensity_orb_match_dual_sampling_pubonly");
+    ros::NodeHandle nh("~");
+    LidarIntensityORBMatchDual node(nh);
+    ros::spin();
+    return 0;
+}
