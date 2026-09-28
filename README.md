@@ -203,6 +203,4 @@ The joint optimizer keeps previous-frame 3D features as the reference and refine
 - The first received frame initializes the feature cache and therefore does not have inter-frame matches or a pose estimate.
 - This module is a front end. It does not include loop closure, global pose-graph optimization, or map management.
 
-## License
 
-This package declares a BSD license in its `package.xml`. No standalone `LICENSE` file is included.
