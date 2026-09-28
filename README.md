@@ -4,6 +4,17 @@ This repository provides a ROS 1 front end for semi-solid LiDARs with a limited 
 
 The implementation is designed as an intensity-assisted odometry module rather than a complete SLAM system. Its pose estimate and corrected cloud can be used as inputs to downstream LiDAR odometry or mapping systems.
 
+## Demo
+
+<p align="center">
+  <img src="docs/demo.gif" alt="lidar_intensity_assist demo" width="720">
+</p>
+
+<!-- TODO: replace docs/demo.gif with your own image path or URL.
+     Gitee cannot embed video (<video> is stripped, <iframe> is escaped), so
+     link a full-length video through a cover image instead, e.g.
+     [![demo video](docs/demo_cover.gif)](https://www.bilibili.com/video/BVxxxxxxxxx) -->
+
 ## Highlights
 
 - Projects 3D LiDAR points to an intensity image using either ring-based or angle-based cylindrical projection.
