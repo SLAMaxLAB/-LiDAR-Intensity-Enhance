@@ -1,6 +1,6 @@
 // Class declaration of the intensity-assisted LiDAR odometry front end.
 //
-// See config/pcd_correction.yaml for the tunable parameters and README.md for
+// See config/start.yaml for the tunable parameters and README.md for
 // the processing pipeline and published topics.
 
 #pragma once
@@ -22,7 +22,7 @@
 #include <string>
 #include <vector>
 
-namespace intensity_image_enhance
+namespace LiDAR_Intensity_Assist
 {
 
 class LidarIntensityORBMatchDual
@@ -445,4 +445,4 @@ private:
 
 };
 
-}  // namespace intensity_image_enhance
+}  // namespace LiDAR_Intensity_Assist

@@ -1,4 +1,4 @@
-# intensity_image_enhance
+# LiDAR_Intensity_Assist
 
 Intensity-assisted LiDAR odometry front end for semi-solid LiDARs with a limited
 horizontal field of view (for example the Hesai AT128). The node projects a
@@ -12,23 +12,23 @@ topic list, configuration reference, and run instructions.
 ## Layout
 
 ```text
-intensity_image_enhance/
+LiDAR_Intensity_Assist/
 ├── CMakeLists.txt
 ├── package.xml
 ├── config/
-│   └── pcd_correction.yaml            # default node parameters
+│   └── start.yaml            # default node parameters
 ├── launch/
-│   └── pcd_correction.launch          # node + optional RViz
+│   └── start.launch          # node + optional RViz
 ├── rviz/
-│   └── pcd_correction.rviz            # example display configuration
-├── include/intensity_image_enhance/
-│   ├── lidar_intensity_orb_matcher.hpp        # main node class declaration
+│   └── start.rviz            # example display configuration
+├── include/LiDAR_Intensity_Assist/
+│   ├── lidar_intensity_match.hpp        # main node class declaration
 │   ├── joint_deskew_iteration_callback.hpp    # Ceres iteration callback
 │   ├── math_utils.hpp                         # small numeric helpers
 │   └── pcd_io_utils.hpp                       # PCD writing helpers
 └── src/
     ├── main.cpp                               # node entry point
-    ├── lidar_intensity_orb_matcher.cpp        # node implementation
+    ├── lidar_intensity_match.cpp        # node implementation
     └── utils/
         └── pcd_io_utils.cpp                   # PCD writing helpers
 ```
@@ -37,14 +37,14 @@ intensity_image_enhance/
 
 ```bash
 source /opt/ros/noetic/setup.bash
-catkin_make --pkg intensity_image_enhance
+catkin_make --pkg LiDAR_Intensity_Assist
 source devel/setup.bash
 ```
 
 ## Run
 
 ```bash
-roslaunch intensity_image_enhance pcd_correction.launch start_rviz:=true
+roslaunch LiDAR_Intensity_Assist start.launch start_rviz:=true
 ```
 
-All tunable parameters live in [config/pcd_correction.yaml](config/pcd_correction.yaml).
+All tunable parameters live in [config/start.yaml](config/start.yaml).

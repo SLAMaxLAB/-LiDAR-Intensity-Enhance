@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.0.2)
-project(intensity_image_enhance)
+project(LiDAR_Intensity_Assist)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -35,7 +35,7 @@ include_directories(
 
 add_executable(pcd_correction_node
   src/main.cpp
-  src/lidar_intensity_orb_matcher.cpp
+  src/lidar_intensity_match.cpp
 )
 
 target_link_libraries(pcd_correction_node
