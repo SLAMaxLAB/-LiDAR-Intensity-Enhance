@@ -16,21 +16,17 @@ lidar_intensity_assist/
 ├── CMakeLists.txt
 ├── package.xml
 ├── config/
-│   └── start.yaml            # default node parameters
+│   └── start.yaml                     # default node parameters
 ├── launch/
-│   └── start.launch          # node + optional RViz
+│   └── start.launch                   # node + optional RViz
 ├── rviz/
-│   └── start.rviz            # example display configuration
+│   └── start.rviz                     # example display configuration
 ├── include/lidar_intensity_assist/
-│   ├── lidar_intensity_match.hpp        # main node class declaration
-│   ├── joint_deskew_iteration_callback.hpp    # Ceres iteration callback
-│   ├── math_utils.hpp                         # small numeric helpers
-│   └── pcd_io_utils.hpp                       # PCD writing helpers
+│   ├── lidar_intensity_match.hpp      # node class declaration
+│   └── math_utils.hpp                 # small numeric helpers
 └── src/
-    ├── main.cpp                               # node entry point
-    ├── lidar_intensity_match.cpp        # node implementation
-    └── utils/
-        └── pcd_io_utils.cpp                   # PCD writing helpers
+    ├── main.cpp                       # node entry point
+    └── lidar_intensity_match.cpp      # node implementation
 ```
 
 ## Build
