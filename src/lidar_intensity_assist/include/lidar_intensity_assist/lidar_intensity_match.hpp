@@ -22,7 +22,7 @@
 #include <string>
 #include <vector>
 
-namespace LiDAR_Intensity_Assist
+namespace lidar_intensity_assist
 {
 
 class LidarIntensityORBMatchDual
@@ -445,4 +445,4 @@ private:
 
 };
 
-}  // namespace LiDAR_Intensity_Assist
+}  // namespace lidar_intensity_assist

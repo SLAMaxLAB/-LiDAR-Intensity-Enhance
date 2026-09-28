@@ -1,12 +1,12 @@
 <launch>
   <arg name="node_name" default="pcd_correction_node"/>
-  <arg name="config_file" default="$(find LiDAR_Intensity_Assist)/config/start.yaml"/>
+  <arg name="config_file" default="$(find lidar_intensity_assist)/config/start.yaml"/>
   <arg name="raw_cloud_topic" default="/raw_cloud"/>
   <arg name="deskewed_cloud_topic" default="/deskewed_cloud"/>
   <arg name="start_rviz" default="true"/>
-  <arg name="rviz_config_file" default="$(find LiDAR_Intensity_Assist)/rviz/start.rviz"/>
+  <arg name="rviz_config_file" default="$(find lidar_intensity_assist)/rviz/start.rviz"/>
 
-  <node pkg="LiDAR_Intensity_Assist"
+  <node pkg="lidar_intensity_assist"
         type="pcd_correction_node"
         name="$(arg node_name)"
         output="screen">
@@ -19,7 +19,7 @@
   <node if="$(arg start_rviz)"
         pkg="rviz"
         type="rviz"
-        name="LiDAR_Intensity_Assist_rviz"
+        name="lidar_intensity_assist_rviz"
         args="-d $(arg rviz_config_file)"
         output="screen"/>
 </launch>

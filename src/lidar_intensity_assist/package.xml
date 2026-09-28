@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <package format="2">
-  <name>LiDAR_Intensity_Assist</name>
+  <name>lidar_intensity_assist</name>
   <version>0.1.0</version>
   <description>
     Intensity-assisted LiDAR odometry front end for semi-solid LiDARs with a
@@ -13,7 +13,7 @@
   <maintainer email="just_like_wind1@163.com">Yu Li</maintainer>
   <license>BSD</license>
 
-  <url type="website">https://gitee.com/SLAMaxLAB/LiDAR_Intensity_Assist</url>
+  <url type="website">https://gitee.com/SLAMaxLAB/lidar_intensity_assist</url>
 
   <buildtool_depend>catkin</buildtool_depend>
 

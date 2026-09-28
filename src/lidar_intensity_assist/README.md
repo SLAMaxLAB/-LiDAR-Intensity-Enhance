@@ -1,4 +1,4 @@
-# LiDAR_Intensity_Assist
+# lidar_intensity_assist
 
 Intensity-assisted LiDAR odometry front end for semi-solid LiDARs with a limited
 horizontal field of view (for example the Hesai AT128). The node projects a
@@ -12,7 +12,7 @@ topic list, configuration reference, and run instructions.
 ## Layout
 
 ```text
-LiDAR_Intensity_Assist/
+lidar_intensity_assist/
 ├── CMakeLists.txt
 ├── package.xml
 ├── config/
@@ -21,7 +21,7 @@ LiDAR_Intensity_Assist/
 │   └── start.launch          # node + optional RViz
 ├── rviz/
 │   └── start.rviz            # example display configuration
-├── include/LiDAR_Intensity_Assist/
+├── include/lidar_intensity_assist/
 │   ├── lidar_intensity_match.hpp        # main node class declaration
 │   ├── joint_deskew_iteration_callback.hpp    # Ceres iteration callback
 │   ├── math_utils.hpp                         # small numeric helpers
@@ -37,14 +37,14 @@ LiDAR_Intensity_Assist/
 
 ```bash
 source /opt/ros/noetic/setup.bash
-catkin_make --pkg LiDAR_Intensity_Assist
+catkin_make --pkg lidar_intensity_assist
 source devel/setup.bash
 ```
 
 ## Run
 
 ```bash
-roslaunch LiDAR_Intensity_Assist start.launch start_rviz:=true
+roslaunch lidar_intensity_assist start.launch start_rviz:=true
 ```
 
 All tunable parameters live in [config/start.yaml](config/start.yaml).

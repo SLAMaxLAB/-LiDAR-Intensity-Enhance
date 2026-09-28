@@ -5,8 +5,8 @@
 // T(cur -> prev), optionally refines it together with a constant-velocity
 // deskew, and publishes the resulting clouds, images, and pose.
 
-#include "LiDAR_Intensity_Assist/lidar_intensity_match.hpp"
-#include "LiDAR_Intensity_Assist/math_utils.hpp"
+#include "lidar_intensity_assist/lidar_intensity_match.hpp"
+#include "lidar_intensity_assist/math_utils.hpp"
 
 #include <ros/ros.h>
 #include <sensor_msgs/Image.h>
@@ -43,7 +43,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-namespace LiDAR_Intensity_Assist
+namespace lidar_intensity_assist
 {
 
 LidarIntensityORBMatchDual::LidarIntensityORBMatchDual(ros::NodeHandle &nh)
@@ -2878,4 +2878,4 @@ void LidarIntensityORBMatchDual::callback(const sensor_msgs::PointCloud2ConstPtr
         frame_idx_++;
     }
 
-}  // namespace LiDAR_Intensity_Assist
+}  // namespace lidar_intensity_assist

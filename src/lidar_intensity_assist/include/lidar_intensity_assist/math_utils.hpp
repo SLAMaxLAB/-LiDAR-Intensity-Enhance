@@ -7,7 +7,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-namespace LiDAR_Intensity_Assist
+namespace lidar_intensity_assist
 {
 
 template <typename T>
@@ -22,4 +22,4 @@ inline double dist3D2(const cv::Point3f &a, const cv::Point3f &b)
     return dx * dx + dy * dy + dz * dz;
 }
 
-}  // namespace LiDAR_Intensity_Assist
+}  // namespace lidar_intensity_assist
