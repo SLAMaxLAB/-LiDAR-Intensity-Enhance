@@ -7,13 +7,8 @@ The implementation is designed as an intensity-assisted odometry module rather t
 ## Demo
 
 <p align="center">
-  <img src="docs/demo.gif" alt="lidar_intensity_assist demo" width="720">
+  <img src="src/lidar_intensity_assist/fig/demo.gif" alt="lidar_intensity_assist demo" width="640">
 </p>
-
-<!-- TODO: replace docs/demo.gif with your own image path or URL.
-     Gitee cannot embed video (<video> is stripped, <iframe> is escaped), so
-     link a full-length video through a cover image instead, e.g.
-     [![demo video](docs/demo_cover.gif)](https://www.bilibili.com/video/BVxxxxxxxxx) -->
 
 ## Highlights
 
@@ -40,6 +35,7 @@ lidar_intensity_assist/
         ├── config/start.yaml                  # default node parameters
         ├── launch/start.launch                # node + optional RViz
         ├── rviz/start.rviz                    # example display configuration
+        ├── fig/demo.gif                       # demo animation used by the README
         ├── include/lidar_intensity_assist/
         │   ├── lidar_intensity_match.hpp      # node class declaration
         │   └── math_utils.hpp                 # small numeric helpers
