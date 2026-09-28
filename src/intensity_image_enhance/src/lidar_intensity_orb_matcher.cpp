@@ -1,104 +1,12 @@
-// lidar_intensity_orb_match_dual_sampling_pubonly.cpp
+// Implementation of the intensity-assisted LiDAR odometry front end.
 //
-// 两种投影模式可选：
-//  1) angle:  行 = elevation 角，列 = azimuth 角
-//  2) ring :  行 = ring 线束编号，列 = azimuth 角
-//
-// 新增：
-//  - 对原始 128 线点云按线束均匀采样到 128/64/32/16（参数可选）
-//  - 只发布采样后的点云，不参与强度图投影
-//
-// 强度图投影：
-//  - 始终使用原始 128 线点云（回调里收到的 msg）进行投影
-//  - 剔除 intensity <= 0 的点
-//  - 一个像素内取强度最大的点
-//  - 点云读取使用裸指针 + offset
-//  - 投影阶段拆分：offset / project / merge / normalize + sampling，各自耗时输出
-//
-// 后续：图像增强 + ORB + 匹配 + 2D/3D-RANSAC + 刚体估计 + time_log
-//
-// 主要参数（ROS param，可通过 launch 设置）:
-//
-//  ~projection_mode            : "angle" 或 "ring"（默认 "angle"）
-//  ~output_dir                 : 输出目录，默认 "./lidar_output"
-//  ~save_image_results         : 是否保存图像结果，默认 true
-//  ~show_match_labels          : 是否显示匹配图中的 prev/cur 标签，默认 true
-//  ~publish_match_images       : 是否发布 ORB/3D 匹配可视化图，默认 true
-//  ~matched_orb_image_topic    : ORB 匹配可视化图像话题，默认 "/matched_orb_image"
-//  ~matched_3d_image_topic     : 3D 匹配可视化图像话题，默认 "/matched_3d_image"
-//  ~matched_prev_points_topic  : 上一帧匹配 ORB 特征对应 3D 点话题，默认 "/matched_prev_orb_points"
-//  ~matched_cur_points_topic   : 当前帧匹配 ORB 特征对应 3D 点话题，默认 "/matched_cur_orb_points"
-//  ~cloud_topic                : 点云话题，默认 "/lidar_points"
-//  ~sampled_cloud_topic        : 采样后点云话题，默认 "sampled_points"
-//  ~v_res                      : 垂直分辨率（行数），默认 128
-//  ~h_res                      : 水平分辨率（列数），默认 500
-//  ~h_fov_deg                  : 水平 FOV，默认 120 度
-//  ~v_min_deg, ~v_max_deg      : 垂直角范围（angle 模式用），默认 -12.5 ~ 12.9
-//  ~sample_step                : 点云采样步长（按点索引采样），默认 1（不采样）
-//  ~filter_origin_points       : 是否过滤坐标原点占位点，默认 true
-//  ~origin_filter_eps          : 原点点判断阈值，默认 1e-6
-//  ~store_all_pixel_points     : 是否为联合优化保存每个像素内所有 3D 点，默认 true
-//
-//  ~enable_line_sampling       : 是否启用按 ring 采样并发布，默认 false
-//  ~source_lines               : 原始线数，默认 128
-//  ~target_lines               : 目标线数，默认 128（建议设为 128/64/32/16）
-//  ~remap_ring_to_compact      : 是否把被选中的 ring 映射到 [0, target_lines-1]，默认 true
-//
-//  ~ratio_thresh               : ORB 比率阈值，默认 0.75
-//  ~hamming_thresh             : Hamming 距离阈值，默认 50
-//  ~ransac_2d_reproj           : 2D RANSAC 重投影误差阈，默认 3 像素
-//  ~ransac_3d_thresh           : 3D RANSAC 距离阈，默认 0.2 m
-//  ~ransac_3d_iters            : 3D RANSAC 迭代次数，默认 100
-//
-//  ~enable_blur                : 是否高斯模糊，默认 false
-//  ~enable_bilateral_filter    : 是否启用双边滤波，默认 true
-//  ~bilateral_d                : 双边滤波邻域直径，默认 5
-//  ~bilateral_sigma_color      : 双边滤波强度域 sigma，默认 30.0
-//  ~bilateral_sigma_space      : 双边滤波空间域 sigma，默认 5.0
-//  ~contrast_mode              : "none" / "equalize" / "clahe"，默认 "clahe"
-//  ~orb_vis_radius             : ORB 可视化点半径，默认 2
-//  ~orb_vis_thickness          : ORB 可视化圆圈线宽，默认 1
-//  ~match_vis_radius           : 匹配可视化特征点圆圈半径，默认 4
-//  ~match_vis_thickness        : 匹配可视化圆圈和连线线宽，默认 1
-//  ~enable_joint_tguess_deskew : 是否启用 Tguess 与当前帧 deskew 联合优化，默认 true
-//  ~joint_pixel_match_mode     : 联合优化使用的像素内 3D 点模式："all" 或 "max_intensity"，默认 "all"
-//  ~joint_tguess_max_iters     : 联合优化最大迭代次数，默认 8
-//  ~joint_tguess_min_matches   : 联合优化最少 3D 内点数，默认 6
-//  ~joint_tguess_huber_delta   : 联合优化 Huber loss 阈值，默认 0.2 m
-//  ~joint_tguess_intensity_weight_scale : intensity 权重增益，默认 0.5
-//  ~joint_tguess_num_threads   : Ceres 联合优化线程数，默认 1（小规模问题通常单线程更快）
-//  ~enable_joint_pair_outlier_rejection : 是否剔除联合优化 3D 配对外点，默认 true
-//  ~joint_pair_outlier_abs_thresh       : 3D 配对残差绝对阈值，默认 0.3 m
-//  ~joint_pair_outlier_mad_k            : MAD 鲁棒阈值系数，默认 4.0
-//  ~joint_pair_outlier_min_thresh       : MAD 阈值下限，默认 0.05 m
-//
-//  ~enable_ransac_2d           : 是否启用 2D-RANSAC，默认 true
-//  ~enable_multithread         : 是否启用多线程（OpenCV+OMP），默认 true
-//  ~num_threads                : 默认线程数，默认 8
-//  ~enable_parallel_projection : 投影阶段是否并行，默认 true
-//  ~enable_parallel_ransac3d   : 3D-RANSAC 是否并行，默认 true
-//  ~ransac3d_threads           : 3D-RANSAC 线程数，默认 = num_threads
-//
-// 输出：
-//  intensity_raw/intensity_raw_#.png          : 原始强度图
-//  intensity_equalize/intensity_equalize_#.png: 直方图均衡化强度图
-//  intensity_clahe/intensity_clahe_#.png      : CLAHE 强度图
-//  intensity_bilateral/intensity_bilateral_#.png: 双边滤波后的增强强度图
-//  intensity_enh/intensity_enh_#.png          : ORB 实际使用的增强图
-//  orb_vis/orb_vis_#.png                      : ORB 关键点可视化
-//  match_orb/match_orb_#.png                  : 原始 ORB 匹配可视化（RANSAC 前）
-//  match_2d/match_2d_#.png                    : 2D-RANSAC 后匹配可视化
-//  match_3d/match_3d_#.png                    : 3D-RANSAC 后匹配可视化
-//  matches_3d/matches_3d_#.txt                : 3D 对应点列表（save_match_text_results=true 时保存）
-//  tguess/all_Tguess.txt                      : 每帧估计的 T_car（tx ty tz roll pitch yaw）
-//  logs/time_log.csv                          : 每帧各阶段耗时（ms）
-//  logs/joint_tguess_deskew_log.csv           : 联合优化的 rmse/迭代次数/耗时日志
-//  matched_orb_image        : 发布到 ROS 的 ORB 匹配可视化图像（sensor_msgs/Image）
-//  matched_3d_image         : 发布到 ROS 的 3D 匹配可视化图像（sensor_msgs/Image）
-//  matched_prev_orb_points  : 发布上一帧 3D-RANSAC 内点对应的 3D 点（sensor_msgs/PointCloud2）
-//  matched_cur_orb_points   : 发布当前帧 3D-RANSAC 内点对应的 3D 点（sensor_msgs/PointCloud2）
-//
-// 注意：需要点云包含字段 x,y,z,intensity，若使用 ring 模式或线束采样，还需要 ring 字段。
+// The node projects a LiDAR cloud into a 2D intensity image, matches ORB
+// features between consecutive frames, estimates the inter-frame transform
+// T(cur -> prev), optionally refines it together with a constant-velocity
+// deskew, and publishes the resulting clouds, images, and pose.
+
+#include "intensity_image_enhance/lidar_intensity_orb_matcher.hpp"
+#include "intensity_image_enhance/math_utils.hpp"
 
 #include <ros/ros.h>
 #include <sensor_msgs/Image.h>
@@ -107,24 +15,22 @@
 #include <nav_msgs/Odometry.h>
 #include <tf/transform_datatypes.h>
 
+#include <pcl/PCLPointCloud2.h>
+#include <pcl/io/pcd_io.h>
+#include <pcl/point_types.h>
+#include <pcl_conversions/pcl_conversions.h>
+
 #include <opencv2/opencv.hpp>
 #include <opencv2/features2d.hpp>
 
 #include <ceres/ceres.h>
 #include <ceres/rotation.h>
 
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <errno.h>
-
 #include <vector>
 #include <algorithm>
 #include <string>
 #include <cmath>
-#include <chrono>
 #include <random>
-#include <fstream>
-#include <iomanip>
 #include <cstring>
 #include <limits>
 #include <cstdint>
@@ -137,468 +43,229 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-template <typename T>
-inline T clampValue(T v, T lo, T hi)
+namespace intensity_image_enhance
 {
-    return (v < lo) ? lo : (v > hi ? hi : v);
-}
 
-inline double dist3D2(const cv::Point3f &a, const cv::Point3f &b)
-{
-    double dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
-    return dx * dx + dy * dy + dz * dz;
-}
-
-class LidarIntensityORBMatchDual
-{
-public:
-    LidarIntensityORBMatchDual(ros::NodeHandle &nh)
+LidarIntensityORBMatchDual::LidarIntensityORBMatchDual(ros::NodeHandle &nh)
         : nh_(nh), frame_idx_(0), has_prev_frame_(false)
+{
+    loadParameters();
+    initAngleBounds();
+    initRosInterfaces();
+    logConfiguration();
+}
+
+void LidarIntensityORBMatchDual::loadParameters()
+{
+    // -------- parameter loading --------
+    nh_.param<std::string>("projection_mode", projection_mode_, std::string("ring")); // "angle" or "ring"
+    nh_.param<bool>("show_match_labels", show_match_labels_, true);
+    nh_.param<bool>("publish_match_images", publish_match_images_, true);
+    nh_.param<bool>("publish_raw_intensity_image", publish_raw_intensity_image_, true);
+    nh_.param<bool>("publish_enhanced_intensity_image", publish_enhanced_intensity_image_, true);
+    nh_.param<bool>("publish_matched_points", publish_matched_points_, true);
+    nh_.param<bool>("latch_published_topics", latch_published_topics_, true);
+    nh_.param<std::string>("raw_intensity_image_topic", raw_intensity_image_topic_, std::string("/raw_intensity_image"));
+    nh_.param<std::string>("enhanced_intensity_image_topic", enhanced_intensity_image_topic_, std::string("/intensity_enh_image"));
+    nh_.param<std::string>("matched_orb_image_topic", matched_orb_image_topic_, std::string("/matched_orb_image"));
+    nh_.param<std::string>("matched_2d_image_topic", matched_2d_image_topic_, std::string("/matched_2d_image"));
+    nh_.param<std::string>("matched_3d_image_topic", matched_3d_image_topic_, std::string("/matched_3d_image"));
+    nh_.param<std::string>("matched_prev_points_topic", matched_prev_points_topic_, std::string("/matched_prev_orb_points"));
+    nh_.param<std::string>("matched_cur_points_topic", matched_cur_points_topic_, std::string("/matched_cur_orb_points"));
+    nh_.param<std::string>("cloud_topic", cloud_topic_, std::string("/lidar_points"));
+    nh_.param<std::string>("sampled_cloud_topic", sampled_cloud_topic_, std::string("/sampled_points"));
+    nh_.param<std::string>("Tguess_topic", Tguess_topic_, std::string("/Tguess"));
+
+    nh_.param<int>("v_res", v_res_, 128);
+    nh_.param<int>("h_res", h_res_, 500);
+    nh_.param<double>("h_fov_deg", h_fov_deg_, 120.0);
+    nh_.param<double>("v_min_deg", v_min_deg_, -12.5);
+    nh_.param<double>("v_max_deg", v_max_deg_, 12.9);
+    nh_.param<int>("sample_step", sample_step_, 1);
+    nh_.param<bool>("filter_origin_points", filter_origin_points_, true);
+    nh_.param<float>("origin_filter_eps", origin_filter_eps_, 1e-6f);
+    nh_.param<bool>("store_all_pixel_points", store_all_pixel_points_, true);
+
+    nh_.param<bool>("enable_line_sampling", enable_line_sampling_, true);
+    nh_.param<int>("source_lines", source_lines_, 128);
+    nh_.param<int>("target_lines", target_lines_, 32);
+    nh_.param<bool>("remap_ring_to_compact", remap_ring_to_compact_, true);
+
+    // deskew & filtering (for Hesai AT128 with per-point timestamp)
+    nh_.param<bool>("enable_deskew_current", enable_deskew_current_, true);
+    nh_.param<bool>("deskew_use_inverse_tguess", deskew_use_inverse_tguess_, false);
+    nh_.param<float>("deskew_min_range", deskew_min_range_, 0.1f);
+    nh_.param<float>("deskew_placeholder_eps", deskew_placeholder_eps_, 1e-6f);
+    nh_.param<bool>("sampling_filter_invalid", sampling_filter_invalid_, true);
+    // deskew time scaling (scan span vs Tguess span)
+    nh_.param<bool>("deskew_scale_by_time", deskew_scale_by_time_, true);
+    nh_.param<double>("deskew_scale_min", deskew_scale_min_, 0.2);
+    nh_.param<double>("deskew_scale_max", deskew_scale_max_, 2.0);
+
+    nh_.param<float>("ratio_thresh", ratio_thresh_, 0.75f);
+    nh_.param<int>("hamming_thresh", hamming_thresh_, 50);
+    nh_.param<double>("ransac_2d_reproj", ransac_2d_reproj_, 3.0);
+    nh_.param<double>("ransac_3d_thresh", ransac_3d_thresh_, 0.1);
+    nh_.param<int>("ransac_3d_iters", ransac_3d_iters_, 100);
+
+    nh_.param<bool>("enable_blur", enable_blur_, false);
+    nh_.param<bool>("enable_bilateral_filter", enable_bilateral_filter_, true);
+    nh_.param<int>("bilateral_d", bilateral_d_, 5);
+    nh_.param<double>("bilateral_sigma_color", bilateral_sigma_color_, 30.0);
+    nh_.param<double>("bilateral_sigma_space", bilateral_sigma_space_, 5.0);
+    nh_.param<std::string>("contrast_mode", contrast_mode_, std::string("clahe"));
+    nh_.param<int>("match_vis_radius", match_vis_radius_, 4);
+    nh_.param<int>("match_vis_thickness", match_vis_thickness_, 1);
+
+    nh_.param<bool>("enable_joint_tguess_deskew", enable_joint_tguess_deskew_, true);
+    nh_.param<std::string>("joint_pixel_match_mode", joint_pixel_match_mode_, std::string("all"));
+    if (joint_pixel_match_mode_ != "all" && joint_pixel_match_mode_ != "max_intensity")
     {
-        // -------- 参数读取 --------
-        nh_.param<std::string>("projection_mode", projection_mode_, std::string("ring")); // "angle" 或 "ring"
-        nh_.param<std::string>("output_dir", output_dir_, std::string("./lidar_output"));
-        nh_.param<bool>("save_image_results", save_image_results_, true);
-        nh_.param<bool>("save_match_text_results", save_match_text_results_, false);
-        nh_.param<bool>("show_match_labels", show_match_labels_, true);
-        nh_.param<bool>("publish_match_images", publish_match_images_, true);
-        nh_.param<bool>("publish_matched_points", publish_matched_points_, true);
-        nh_.param<std::string>("matched_orb_image_topic", matched_orb_image_topic_, std::string("/matched_orb_image"));
-        nh_.param<std::string>("matched_3d_image_topic", matched_3d_image_topic_, std::string("/matched_3d_image"));
-        nh_.param<std::string>("matched_prev_points_topic", matched_prev_points_topic_, std::string("/matched_prev_orb_points"));
-        nh_.param<std::string>("matched_cur_points_topic", matched_cur_points_topic_, std::string("/matched_cur_orb_points"));
-        nh_.param<std::string>("cloud_topic", cloud_topic_, std::string("/lidar_points"));
-        nh_.param<std::string>("sampled_cloud_topic", sampled_cloud_topic_, std::string("/sampled_points"));
-        nh_.param<std::string>("Tguess_topic", Tguess_topic_, std::string("/Tguess"));
-
-        nh_.param<int>("v_res", v_res_, 128);
-        nh_.param<int>("h_res", h_res_, 500);
-        nh_.param<double>("h_fov_deg", h_fov_deg_, 120.0);
-        nh_.param<double>("v_min_deg", v_min_deg_, -12.5);
-        nh_.param<double>("v_max_deg", v_max_deg_, 12.9);
-        nh_.param<int>("sample_step", sample_step_, 1);
-        nh_.param<bool>("filter_origin_points", filter_origin_points_, true);
-        nh_.param<float>("origin_filter_eps", origin_filter_eps_, 1e-6f);
-        nh_.param<bool>("store_all_pixel_points", store_all_pixel_points_, true);
-
-        nh_.param<bool>("enable_line_sampling", enable_line_sampling_, true);
-        nh_.param<int>("source_lines", source_lines_, 128);
-        nh_.param<int>("target_lines", target_lines_, 32);
-        nh_.param<bool>("remap_ring_to_compact", remap_ring_to_compact_, true);
-
-        // deskew & filtering (for Hesai AT128 with per-point timestamp)
-        nh_.param<bool>("enable_deskew_current", enable_deskew_current_, true);
-        nh_.param<bool>("deskew_use_inverse_tguess", deskew_use_inverse_tguess_, false);
-        nh_.param<float>("deskew_min_range", deskew_min_range_, 0.1f);
-        nh_.param<float>("deskew_placeholder_eps", deskew_placeholder_eps_, 1e-6f);
-        nh_.param<bool>("sampling_filter_invalid", sampling_filter_invalid_, true);
-        // deskew time scaling (scan span vs Tguess span)
-        nh_.param<bool>("deskew_scale_by_time", deskew_scale_by_time_, true);
-        nh_.param<double>("deskew_scale_min", deskew_scale_min_, 0.2);
-        nh_.param<double>("deskew_scale_max", deskew_scale_max_, 2.0);
-
-        nh_.param<float>("ratio_thresh", ratio_thresh_, 0.75f);
-        nh_.param<int>("hamming_thresh", hamming_thresh_, 50);
-        nh_.param<double>("ransac_2d_reproj", ransac_2d_reproj_, 3.0);
-        nh_.param<double>("ransac_3d_thresh", ransac_3d_thresh_, 0.1);
-        nh_.param<int>("ransac_3d_iters", ransac_3d_iters_, 100);
-
-        nh_.param<bool>("enable_blur", enable_blur_, false);
-        nh_.param<bool>("enable_bilateral_filter", enable_bilateral_filter_, true);
-        nh_.param<int>("bilateral_d", bilateral_d_, 5);
-        nh_.param<double>("bilateral_sigma_color", bilateral_sigma_color_, 30.0);
-        nh_.param<double>("bilateral_sigma_space", bilateral_sigma_space_, 5.0);
-        nh_.param<std::string>("contrast_mode", contrast_mode_, std::string("clahe"));
-        nh_.param<int>("orb_vis_radius", orb_vis_radius_, 2);
-        nh_.param<int>("orb_vis_thickness", orb_vis_thickness_, 1);
-        nh_.param<int>("match_vis_radius", match_vis_radius_, 4);
-        nh_.param<int>("match_vis_thickness", match_vis_thickness_, 1);
-
-        nh_.param<bool>("enable_joint_tguess_deskew", enable_joint_tguess_deskew_, true);
-        nh_.param<std::string>("joint_pixel_match_mode", joint_pixel_match_mode_, std::string("all"));
-        if (joint_pixel_match_mode_ != "all" && joint_pixel_match_mode_ != "max_intensity")
-        {
-            ROS_WARN("Invalid joint_pixel_match_mode='%s', fallback to 'all'. Valid values: all, max_intensity",
-                     joint_pixel_match_mode_.c_str());
-            joint_pixel_match_mode_ = "all";
-        }
-        if (joint_pixel_match_mode_ == "all" && !store_all_pixel_points_)
-        {
-            ROS_WARN("joint_pixel_match_mode='all' requires store_all_pixel_points=true; fallback to 'max_intensity'.");
-            joint_pixel_match_mode_ = "max_intensity";
-        }
-        nh_.param<int>("joint_tguess_max_iters", joint_tguess_max_iters_, 8);
-        nh_.param<int>("joint_tguess_min_matches", joint_tguess_min_matches_, 6);
-        nh_.param<double>("joint_tguess_huber_delta", joint_tguess_huber_delta_, 0.2);
-        nh_.param<double>("joint_tguess_intensity_weight_scale", joint_tguess_intensity_weight_scale_, 0.5);
-        nh_.param<int>("joint_tguess_num_threads", joint_tguess_num_threads_, 1);
-        nh_.param<bool>("enable_joint_pair_outlier_rejection", enable_joint_pair_outlier_rejection_, true);
-        nh_.param<double>("joint_pair_outlier_abs_thresh", joint_pair_outlier_abs_thresh_, 0.3);
-        nh_.param<double>("joint_pair_outlier_mad_k", joint_pair_outlier_mad_k_, 4.0);
-        nh_.param<double>("joint_pair_outlier_min_thresh", joint_pair_outlier_min_thresh_, 0.05);
-
-        nh_.param<int>("orb_nfeatures", orb_nfeatures_, 300);
-        nh_.param<double>("orb_scaleFactor", orb_scaleFactor_, 1.1);
-        nh_.param<int>("orb_nlevels", orb_nlevels_, 4);
-        nh_.param<int>("orb_edgeThreshold", orb_edgeThreshold_, 5);
-        nh_.param<int>("orb_patchSize", orb_patchSize_, 31);
-        nh_.param<int>("orb_fastThreshold", orb_fastThreshold_, 5);
-        nh_.param<int>("orb_wta_k", orb_wta_k_, 2);
-        int orb_score_type_int = 0;
-        nh_.param<int>("orb_score_type", orb_score_type_int, 0);
-        orb_score_type_ = (orb_score_type_int == 1) ? cv::ORB::FAST_SCORE : cv::ORB::HARRIS_SCORE;
-
-        nh_.param<bool>("enable_ransac_2d", enable_ransac_2d_, true);
-        nh_.param<bool>("enable_multithread", enable_multithread_, true);
-        nh_.param<int>("num_threads", num_threads_, 6);
-        nh_.param<bool>("enable_parallel_projection", enable_parallel_projection_, true);
-        nh_.param<bool>("enable_parallel_ransac3d", enable_parallel_ransac3d_, true);
-        nh_.param<int>("ransac3d_threads", ransac3d_threads_, num_threads_);
-
-        // 创建输出目录；不清空已有结果，避免重启节点时删除历史输出。
-        ensureDirectory(output_dir_);
-        ensureOutputSubdirectories();
-
-        // 角度边界（弧度）
-        min_az_ = -h_fov_deg_ / 2.0 * M_PI / 180.0;
-        max_az_ = h_fov_deg_ / 2.0 * M_PI / 180.0;
-        min_el_ = v_min_deg_ * M_PI / 180.0;
-        max_el_ = v_max_deg_ * M_PI / 180.0;
-
-        // 订阅和发布
-        sub_ = nh_.subscribe(cloud_topic_, 1, &LidarIntensityORBMatchDual::callback, this);
-        tguess_pub_ = nh_.advertise<nav_msgs::Odometry>(Tguess_topic_, 1);
-        sampled_pub_ = nh_.advertise<sensor_msgs::PointCloud2>(sampled_cloud_topic_, 1);
-        cloudraw_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("raw_cloud", 1);
-        deskewedcloud_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("deskewed_cloud", 1);
-        matchedorb_image_pub_ = nh_.advertise<sensor_msgs::Image>(matched_orb_image_topic_, 1);
-        matched3d_image_pub_ = nh_.advertise<sensor_msgs::Image>(matched_3d_image_topic_, 1);
-        matchedprev_points_pub_ = nh_.advertise<sensor_msgs::PointCloud2>(matched_prev_points_topic_, 1);
-        matchedcur_points_pub_ = nh_.advertise<sensor_msgs::PointCloud2>(matched_cur_points_topic_, 1);
-        // RNG
-        rng_.seed(std::random_device{}());
-
-        // OpenCV 线程设置
-        if (enable_multithread_)
-        {
-            cv::setUseOptimized(true);
-            cv::setNumThreads(num_threads_);
-            ROS_INFO("OpenCV multithreading enabled. num_threads=%d", num_threads_);
-        }
-        else
-        {
-            cv::setNumThreads(1);
-            ROS_INFO("OpenCV multithreading disabled, force num_threads=1");
-        }
-
-        // time_log.csv
-        std::ofstream tlog(outputPath("logs", "time_log.csv"), std::ios::app);
-        if (tlog.tellp() == 0)
-        {
-            tlog << "frame,sample_ms,proj_ms,enh_ms,orb_ms,match_ms,ransac2d_ms,ransac3d_ms,total_ms\n";
-        }
-        std::ofstream joint_log(outputPath("logs", "joint_tguess_deskew_log.csv"), std::ios::app);
-        if (joint_log.tellp() == 0)
-        {
-            joint_log << "frame,used_matches,alpha,initial_rmse,final_rmse,iterations,time_ms,solution_usable\n";
-        }
-        tlog.close();
-        joint_log.close();
-
-        ROS_INFO("Node initialized. Output dir: %s", output_dir_.c_str());
-        ROS_INFO("Image size: %d x %d ; h_fov: %.2f deg ; v_range: %.2f ~ %.2f deg",
-                 v_res_, h_res_, h_fov_deg_, v_min_deg_, v_max_deg_);
-        ROS_INFO("Projection mode = %s (\"angle\" or \"ring\")",
-                 projection_mode_.c_str());
-        ROS_INFO("Save image results: %s",
-                 save_image_results_ ? "ENABLED" : "DISABLED");
-        ROS_INFO("Save 3D match text results: %s",
-                 save_match_text_results_ ? "ENABLED" : "DISABLED");
-        ROS_INFO("Show match labels: %s",
-                 show_match_labels_ ? "ENABLED" : "DISABLED");
-        ROS_INFO("Publish match visualization images: %s",
-                 publish_match_images_ ? "ENABLED" : "DISABLED");
-        ROS_INFO("Publish matched point clouds: %s",
-                 publish_matched_points_ ? "ENABLED" : "DISABLED");
-        ROS_INFO("Matched ORB image topic: %s",
-                 matched_orb_image_topic_.c_str());
-        ROS_INFO("Matched 3D image topic: %s",
-                 matched_3d_image_topic_.c_str());
-        ROS_INFO("Matched prev 3D points topic: %s",
-                 matched_prev_points_topic_.c_str());
-        ROS_INFO("Matched current 3D points topic: %s",
-                 matched_cur_points_topic_.c_str());
-        ROS_INFO("Joint Tguess-deskew optimization: %s, iters=%d min_matches=%d huber=%.3f intensity_weight_scale=%.3f",
-                 enable_joint_tguess_deskew_ ? "ENABLED" : "DISABLED",
-                 joint_tguess_max_iters_, joint_tguess_min_matches_,
-                 joint_tguess_huber_delta_, joint_tguess_intensity_weight_scale_);
-        ROS_INFO("Joint pixel match mode: %s",
+        ROS_WARN("Invalid joint_pixel_match_mode='%s', fallback to 'all'. Valid values: all, max_intensity",
                  joint_pixel_match_mode_.c_str());
-        ROS_INFO("Joint Tguess-deskew Ceres threads: %d",
-                 std::max(1, joint_tguess_num_threads_));
-        ROS_INFO("Joint 3D pair outlier rejection: %s, abs_thresh=%.3f m mad_k=%.2f min_thresh=%.3f m",
-                 enable_joint_pair_outlier_rejection_ ? "ENABLED" : "DISABLED",
-                 joint_pair_outlier_abs_thresh_, joint_pair_outlier_mad_k_,
-                 joint_pair_outlier_min_thresh_);
-        ROS_INFO("Image smoothing: gaussian=%s bilateral=%s d=%d sigma_color=%.2f sigma_space=%.2f",
-                 enable_blur_ ? "ENABLED" : "DISABLED",
-                 enable_bilateral_filter_ ? "ENABLED" : "DISABLED",
-                 bilateral_d_, bilateral_sigma_color_, bilateral_sigma_space_);
-        ROS_INFO("Filter origin points: %s, eps=%.3e",
-                 filter_origin_points_ ? "ENABLED" : "DISABLED", origin_filter_eps_);
-        ROS_INFO("Store all 3D points per intensity pixel: %s",
-                 store_all_pixel_points_ ? "ENABLED" : "DISABLED");
-        ROS_INFO("Line sampling (publish only): %s, source_lines=%d target_lines=%d remap=%s",
-                 enable_line_sampling_ ? "ENABLED" : "DISABLED",
-                 source_lines_, target_lines_, remap_ring_to_compact_ ? "true" : "false");
+        joint_pixel_match_mode_ = "all";
     }
-
-private:
-    struct PixelPoint
+    if (joint_pixel_match_mode_ == "all" && !store_all_pixel_points_)
     {
-        float x = 0.0f, y = 0.0f, z = 0.0f;
-        float intensity = 0.0f;
-        double timestamp = std::numeric_limits<double>::quiet_NaN();
-    };
-
-    struct PixAcc
-    {
-        float max_intensity = 0.0f;
-        float x = 0.0f, y = 0.0f, z = 0.0f;
-        double timestamp = std::numeric_limits<double>::quiet_NaN();
-        bool has_point = false;
-    };
-
-    struct PixelPointRecord
-    {
-        size_t pid = 0;
-        PixelPoint point;
-    };
-
-    ros::NodeHandle nh_;
-    ros::Subscriber sub_;
-    ros::Publisher sampled_pub_;
-    ros::Publisher tguess_pub_;
-    ros::Publisher cloudraw_pub_;
-    ros::Publisher deskewedcloud_pub_;
-    ros::Publisher matchedorb_image_pub_;
-    ros::Publisher matched3d_image_pub_;
-    ros::Publisher matchedprev_points_pub_;
-    ros::Publisher matchedcur_points_pub_;
-
-    std::string output_dir_;
-    std::string cloud_topic_;
-    std::string sampled_cloud_topic_;
-    std::string Tguess_topic_;
-    std::string matched_orb_image_topic_;
-    std::string matched_3d_image_topic_;
-    std::string matched_prev_points_topic_;
-    std::string matched_cur_points_topic_;
-    std::string projection_mode_;
-    bool save_image_results_;
-    bool save_match_text_results_;
-    bool show_match_labels_;
-    bool publish_match_images_;
-    bool publish_matched_points_;
-
-    int v_res_, h_res_, sample_step_;
-    double h_fov_deg_, v_min_deg_, v_max_deg_;
-    double min_az_, max_az_, min_el_, max_el_;
-    bool filter_origin_points_;
-    float origin_filter_eps_;
-    bool store_all_pixel_points_;
-
-    // 线束采样相关（仅用于发布）
-    bool enable_line_sampling_;
-    int source_lines_;
-    int target_lines_;
-    bool remap_ring_to_compact_;
-
-    // deskew current frame by Tguess (requires per-point timestamp)
-    bool enable_deskew_current_;
-    bool deskew_use_inverse_tguess_;
-    float deskew_min_range_;
-    float deskew_placeholder_eps_;
-    bool sampling_filter_invalid_;
-
-    // deskew time scaling helpers
-    bool deskew_scale_by_time_;
-    double deskew_scale_min_;
-    double deskew_scale_max_;
-
-    // per-frame timestamp mid (from per-point 'timestamp' field)
-    double prev_scan_mid_ts_ = std::numeric_limits<double>::quiet_NaN();
-    bool prev_scan_mid_valid_ = false;
-
-    // ORB & RANSAC 参数
-    float ratio_thresh_;
-    int hamming_thresh_;
-    double ransac_2d_reproj_;
-    double ransac_3d_thresh_;
-    int ransac_3d_iters_;
-
-    bool enable_blur_;
-    bool enable_bilateral_filter_;
-    int bilateral_d_;
-    double bilateral_sigma_color_;
-    double bilateral_sigma_space_;
-    std::string contrast_mode_;
-    int orb_vis_radius_;
-    int orb_vis_thickness_;
-    int match_vis_radius_;
-    int match_vis_thickness_;
-    bool enable_joint_tguess_deskew_;
-    std::string joint_pixel_match_mode_;
-    int joint_tguess_max_iters_;
-    int joint_tguess_min_matches_;
-    double joint_tguess_huber_delta_;
-    double joint_tguess_intensity_weight_scale_;
-    int joint_tguess_num_threads_;
-    bool enable_joint_pair_outlier_rejection_;
-    double joint_pair_outlier_abs_thresh_;
-    double joint_pair_outlier_mad_k_;
-    double joint_pair_outlier_min_thresh_;
-
-    int orb_nfeatures_, orb_nlevels_, orb_edgeThreshold_, orb_patchSize_, orb_fastThreshold_, orb_wta_k_;
-    double orb_scaleFactor_;
-    cv::ORB::ScoreType orb_score_type_;
-
-    bool enable_ransac_2d_;
-    bool enable_multithread_;
-    int num_threads_;
-    bool enable_parallel_projection_;
-    bool enable_parallel_ransac3d_;
-    int ransac3d_threads_;
-
-    int frame_idx_;
-    bool has_prev_frame_;
-    cv::Mat prev_img_;
-    cv::Mat prev_desc_;
-    std::vector<cv::KeyPoint> prev_kp_;
-    std::vector<float> prev_px_, prev_py_, prev_pz_;
-    std::vector<float> prev_pint_;
-    std::vector<double> prev_pts_;
-    std::vector<std::vector<PixelPoint>> prev_pixel_points_;
-    std::vector<char> prev_has_;
-    std_msgs::Header prev_cloud_header_;
-
-    std::mt19937 rng_;
-
-    bool ensureDirectory(const std::string &dir) const
-    {
-        if (dir.empty())
-        {
-            ROS_WARN("mkdir skipped: empty directory path");
-            return false;
-        }
-
-        struct stat st;
-        if (stat(dir.c_str(), &st) == 0)
-        {
-            if (S_ISDIR(st.st_mode))
-                return true;
-            ROS_WARN("mkdir failed: %s exists but is not a directory", dir.c_str());
-            return false;
-        }
-
-        if (mkdir(dir.c_str(), 0777) == 0)
-            return true;
-
-        if (errno == EEXIST)
-            return true;
-
-        ROS_WARN("mkdir failed: %s", dir.c_str());
-        return false;
+        ROS_WARN("joint_pixel_match_mode='all' requires store_all_pixel_points=true; fallback to 'max_intensity'.");
+        joint_pixel_match_mode_ = "max_intensity";
     }
+    nh_.param<int>("joint_tguess_max_iters", joint_tguess_max_iters_, 8);
+    nh_.param<int>("joint_tguess_min_matches", joint_tguess_min_matches_, 6);
+    nh_.param<double>("joint_tguess_huber_delta", joint_tguess_huber_delta_, 0.2);
+    nh_.param<double>("joint_tguess_intensity_weight_scale", joint_tguess_intensity_weight_scale_, 0.5);
+    nh_.param<int>("joint_tguess_num_threads", joint_tguess_num_threads_, 1);
+    nh_.param<bool>("enable_joint_pair_outlier_rejection", enable_joint_pair_outlier_rejection_, true);
+    nh_.param<double>("joint_pair_outlier_abs_thresh", joint_pair_outlier_abs_thresh_, 0.3);
+    nh_.param<double>("joint_pair_outlier_mad_k", joint_pair_outlier_mad_k_, 4.0);
+    nh_.param<double>("joint_pair_outlier_min_thresh", joint_pair_outlier_min_thresh_, 0.05);
 
-    std::string outputPath(const std::string &subdir, const std::string &filename) const
+    nh_.param<int>("orb_nfeatures", orb_nfeatures_, 300);
+    nh_.param<double>("orb_scaleFactor", orb_scaleFactor_, 1.1);
+    nh_.param<int>("orb_nlevels", orb_nlevels_, 4);
+    nh_.param<int>("orb_edgeThreshold", orb_edgeThreshold_, 5);
+    nh_.param<int>("orb_patchSize", orb_patchSize_, 31);
+    nh_.param<int>("orb_fastThreshold", orb_fastThreshold_, 5);
+    nh_.param<int>("orb_wta_k", orb_wta_k_, 2);
+    int orb_score_type_int = 0;
+    nh_.param<int>("orb_score_type", orb_score_type_int, 0);
+    orb_score_type_ = (orb_score_type_int == 1) ? cv::ORB::FAST_SCORE : cv::ORB::HARRIS_SCORE;
+
+    nh_.param<bool>("enable_ransac_2d", enable_ransac_2d_, true);
+    nh_.param<bool>("enable_multithread", enable_multithread_, true);
+    nh_.param<int>("num_threads", num_threads_, 6);
+    nh_.param<bool>("enable_parallel_projection", enable_parallel_projection_, true);
+    nh_.param<bool>("enable_parallel_ransac3d", enable_parallel_ransac3d_, true);
+    nh_.param<int>("ransac3d_threads", ransac3d_threads_, num_threads_);
+}
+
+void LidarIntensityORBMatchDual::initAngleBounds()
+{
+    // angular bounds (radians)
+    min_az_ = -h_fov_deg_ / 2.0 * M_PI / 180.0;
+    max_az_ = h_fov_deg_ / 2.0 * M_PI / 180.0;
+    min_el_ = v_min_deg_ * M_PI / 180.0;
+    max_el_ = v_max_deg_ * M_PI / 180.0;
+}
+
+void LidarIntensityORBMatchDual::initRosInterfaces()
+{
+    // subscribers and publishers
+    sub_ = nh_.subscribe(cloud_topic_, 1, &LidarIntensityORBMatchDual::callback, this);
+    // Latching retains the newest result for RViz displays that subscribe after bag playback pauses.
+    tguess_pub_ = nh_.advertise<nav_msgs::Odometry>(Tguess_topic_, 1, latch_published_topics_);
+    sampled_pub_ = nh_.advertise<sensor_msgs::PointCloud2>(sampled_cloud_topic_, 1, latch_published_topics_);
+    cloudraw_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("raw_cloud", 1, latch_published_topics_);
+    deskewedcloud_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("deskewed_cloud", 1, latch_published_topics_);
+    raw_intensity_image_pub_ = nh_.advertise<sensor_msgs::Image>(raw_intensity_image_topic_, 1, latch_published_topics_);
+    enhanced_intensity_image_pub_ = nh_.advertise<sensor_msgs::Image>(enhanced_intensity_image_topic_, 1, latch_published_topics_);
+    matchedorb_image_pub_ = nh_.advertise<sensor_msgs::Image>(matched_orb_image_topic_, 1, latch_published_topics_);
+    matched2d_image_pub_ = nh_.advertise<sensor_msgs::Image>(matched_2d_image_topic_, 1, latch_published_topics_);
+    matched3d_image_pub_ = nh_.advertise<sensor_msgs::Image>(matched_3d_image_topic_, 1, latch_published_topics_);
+    matchedprev_points_pub_ = nh_.advertise<sensor_msgs::PointCloud2>(matched_prev_points_topic_, 1, latch_published_topics_);
+    matchedcur_points_pub_ = nh_.advertise<sensor_msgs::PointCloud2>(matched_cur_points_topic_, 1, latch_published_topics_);
+    // RNG
+    rng_.seed(std::random_device{}());
+
+    // OpenCV threading setup
+    if (enable_multithread_)
     {
-        const std::string dir = output_dir_ + "/" + subdir;
-        ensureDirectory(dir);
-        return dir + "/" + filename;
+        cv::setUseOptimized(true);
+        cv::setNumThreads(num_threads_);
+        ROS_INFO("OpenCV multithreading enabled. num_threads=%d", num_threads_);
     }
-
-    void ensureOutputSubdirectories() const
+    else
     {
-        static const char *const subdirs[] = {
-            "intensity_raw",
-            "intensity_equalize",
-            "intensity_clahe",
-            "intensity_bilateral",
-            "intensity_enh",
-            "orb_vis",
-            "match_orb",
-            "match_2d",
-            "match_3d",
-            "matches_3d",
-            "tguess",
-            "logs",
-        };
-
-        for (const char *subdir : subdirs)
-        {
-            ensureDirectory(output_dir_ + "/" + subdir);
-        }
+        cv::setNumThreads(1);
+        ROS_INFO("OpenCV multithreading disabled, force num_threads=1");
     }
+}
 
-    struct JointTguessDeskewResidual
-    {
-        JointTguessDeskewResidual(const cv::Point3f &p_prev,
-                                  const cv::Point3f &p_cur,
-                                  double s_cur,
-                                  double alpha,
-                                  double sqrt_weight)
-            : px(p_prev.x), py(p_prev.y), pz(p_prev.z),
-              qx(p_cur.x), qy(p_cur.y), qz(p_cur.z),
-              s(s_cur), a(alpha), sw(sqrt_weight)
-        {
-        }
+void LidarIntensityORBMatchDual::logConfiguration()
+{
+    ROS_INFO("Node initialized.");
+    ROS_INFO("Image size: %d x %d ; h_fov: %.2f deg ; v_range: %.2f ~ %.2f deg",
+             v_res_, h_res_, h_fov_deg_, v_min_deg_, v_max_deg_);
+    ROS_INFO("Projection mode = %s (\"angle\" or \"ring\")",
+             projection_mode_.c_str());
+    ROS_INFO("Show match/image labels: %s",
+             show_match_labels_ ? "ENABLED" : "DISABLED");
+    ROS_INFO("Publish match visualization images: %s",
+             publish_match_images_ ? "ENABLED" : "DISABLED");
+    ROS_INFO("Publish raw intensity image: %s",
+             publish_raw_intensity_image_ ? "ENABLED" : "DISABLED");
+    ROS_INFO("Raw intensity image topic: %s",
+             raw_intensity_image_topic_.c_str());
+    ROS_INFO("Publish enhanced intensity image: %s",
+             publish_enhanced_intensity_image_ ? "ENABLED" : "DISABLED");
+    ROS_INFO("Enhanced intensity image topic: %s",
+             enhanced_intensity_image_topic_.c_str());
+    ROS_INFO("Publish matched point clouds: %s",
+             publish_matched_points_ ? "ENABLED" : "DISABLED");
+    ROS_INFO("Latch published topics: %s",
+             latch_published_topics_ ? "ENABLED" : "DISABLED");
+    ROS_INFO("Matched ORB image topic: %s",
+             matched_orb_image_topic_.c_str());
+    ROS_INFO("Matched 2D image topic: %s",
+             matched_2d_image_topic_.c_str());
+    ROS_INFO("Matched 3D image topic: %s",
+             matched_3d_image_topic_.c_str());
+    ROS_INFO("Matched prev 3D points topic: %s",
+             matched_prev_points_topic_.c_str());
+    ROS_INFO("Matched current 3D points topic: %s",
+             matched_cur_points_topic_.c_str());
+    ROS_INFO("Joint Tguess-deskew optimization: %s, iters=%d min_matches=%d huber=%.3f intensity_weight_scale=%.3f",
+             enable_joint_tguess_deskew_ ? "ENABLED" : "DISABLED",
+             joint_tguess_max_iters_, joint_tguess_min_matches_,
+             joint_tguess_huber_delta_, joint_tguess_intensity_weight_scale_);
+    ROS_INFO("Joint pixel match mode: %s",
+             joint_pixel_match_mode_.c_str());
+    ROS_INFO("Joint Tguess-deskew Ceres threads: %d",
+             std::max(1, joint_tguess_num_threads_));
+    ROS_INFO("Joint 3D pair outlier rejection: %s, abs_thresh=%.3f m mad_k=%.2f min_thresh=%.3f m",
+             enable_joint_pair_outlier_rejection_ ? "ENABLED" : "DISABLED",
+             joint_pair_outlier_abs_thresh_, joint_pair_outlier_mad_k_,
+             joint_pair_outlier_min_thresh_);
+    ROS_INFO("Image smoothing: gaussian=%s bilateral=%s d=%d sigma_color=%.2f sigma_space=%.2f",
+             enable_blur_ ? "ENABLED" : "DISABLED",
+             enable_bilateral_filter_ ? "ENABLED" : "DISABLED",
+             bilateral_d_, bilateral_sigma_color_, bilateral_sigma_space_);
+    ROS_INFO("Filter origin points: %s, eps=%.3e",
+             filter_origin_points_ ? "ENABLED" : "DISABLED", origin_filter_eps_);
+    ROS_INFO("Store all 3D points per intensity pixel: %s",
+             store_all_pixel_points_ ? "ENABLED" : "DISABLED");
+    ROS_INFO("Line sampling (publish only): %s, source_lines=%d target_lines=%d remap=%s",
+             enable_line_sampling_ ? "ENABLED" : "DISABLED",
+             source_lines_, target_lines_, remap_ring_to_compact_ ? "true" : "false");
+    
+}
 
-        template <typename T>
-        bool operator()(const T *const pose, T *residuals) const
-        {
-            const T p[3] = {T(px), T(py), T(pz)};
-            const T q[3] = {T(qx), T(qy), T(qz)};
-
-            T q_minus_t[3] = {
-                q[0] - T(s * a) * pose[3],
-                q[1] - T(s * a) * pose[4],
-                q[2] - T(s * a) * pose[5],
-            };
-
-            T neg_r_scan[3] = {
-                -T(s * a) * pose[0],
-                -T(s * a) * pose[1],
-                -T(s * a) * pose[2],
-            };
-            T q_deskew[3];
-            ceres::AngleAxisRotatePoint(neg_r_scan, q_minus_t, q_deskew);
-
-            T p_pred[3];
-            ceres::AngleAxisRotatePoint(pose, p, p_pred);
-            p_pred[0] += pose[3];
-            p_pred[1] += pose[4];
-            p_pred[2] += pose[5];
-
-            residuals[0] = T(sw) * (q_deskew[0] - p_pred[0]);
-            residuals[1] = T(sw) * (q_deskew[1] - p_pred[1]);
-            residuals[2] = T(sw) * (q_deskew[2] - p_pred[2]);
-            return true;
-        }
-
-        double px, py, pz;
-        double qx, qy, qz;
-        double s;
-        double a;
-        double sw;
-    };
-
-    cv::Point3d deskewFeaturePointByPose(const cv::Point3f &q,
+cv::Point3d LidarIntensityORBMatchDual::deskewFeaturePointByPose(const cv::Point3f &q,
                                          double s,
                                          double alpha,
                                          const cv::Mat &R,
                                          const cv::Mat &t) const
-    {
+{
         cv::Mat rvec;
         cv::Rodrigues(R, rvec);
         rvec *= (s * alpha);
@@ -614,27 +281,43 @@ private:
                            q_deskew.at<double>(2));
     }
 
-    cv::Point3d transformFeaturePointByPose(const cv::Point3f &p,
-                                            const cv::Mat &R,
-                                            const cv::Mat &t) const
-    {
-        cv::Mat p_mat = (cv::Mat_<double>(3, 1) << p.x, p.y, p.z);
-        cv::Mat p_pred = R * p_mat + t;
-        return cv::Point3d(p_pred.at<double>(0),
-                           p_pred.at<double>(1),
-                           p_pred.at<double>(2));
+void LidarIntensityORBMatchDual::invertRigidTransform(const cv::Mat &R,
+                                     const cv::Mat &t,
+                                     cv::Mat &R_inv,
+                                     cv::Mat &t_inv)
+{
+        R_inv = R.t();
+        t_inv = -R_inv * t;
     }
 
-    static cv::Point3f toPoint3f(const PixelPoint &p)
-    {
+cv::Point3d LidarIntensityORBMatchDual::mapCurrentFeatureToPreviousReference(const cv::Point3f &q,
+                                                      double s,
+                                                      double alpha,
+                                                      const cv::Mat &R_cur_to_prev,
+                                                      const cv::Mat &t_cur_to_prev,
+                                                      const cv::Mat &R_prev_to_cur,
+                                                      const cv::Mat &t_prev_to_cur) const
+{
+        const cv::Point3d q_deskew =
+            deskewFeaturePointByPose(q, s, alpha, R_prev_to_cur, t_prev_to_cur);
+
+        cv::Mat q_mat = (cv::Mat_<double>(3, 1) << q_deskew.x, q_deskew.y, q_deskew.z);
+        cv::Mat q_in_prev = R_cur_to_prev * q_mat + t_cur_to_prev;
+        return cv::Point3d(q_in_prev.at<double>(0),
+                           q_in_prev.at<double>(1),
+                           q_in_prev.at<double>(2));
+    }
+
+cv::Point3f LidarIntensityORBMatchDual::toPoint3f(const PixelPoint &p)
+{
         return cv::Point3f(p.x, p.y, p.z);
     }
 
-    void materializePixelPointBuckets(
+void LidarIntensityORBMatchDual::materializePixelPointBuckets(
         size_t total_pix,
         const std::vector<std::vector<PixelPointRecord>> &thread_point_records,
         std::vector<std::vector<PixelPoint>> &pixel_points) const
-    {
+{
         pixel_points.assign(total_pix, std::vector<PixelPoint>());
         if (!store_all_pixel_points_)
             return;
@@ -665,8 +348,8 @@ private:
         }
     }
 
-    static double medianValue(std::vector<double> values)
-    {
+double LidarIntensityORBMatchDual::medianValue(std::vector<double> values)
+{
         if (values.empty())
             return std::numeric_limits<double>::quiet_NaN();
 
@@ -678,7 +361,7 @@ private:
         return 0.5 * (values[mid - 1] + values[mid]);
     }
 
-    size_t buildNearestPixelSetCorrespondences(
+size_t LidarIntensityORBMatchDual::buildNearestPixelSetCorrespondences(
         const std::vector<std::pair<int, int>> &pixel_pairs,
         const std::vector<std::vector<PixelPoint>> &prev_pixel_points,
         const std::vector<std::vector<PixelPoint>> &cur_pixel_points,
@@ -696,7 +379,7 @@ private:
         size_t &raw_pairs_out,
         size_t &rejected_pairs_out,
         double &reject_threshold_out) const
-    {
+{
         P.clear();
         Q.clear();
         P_intensity.clear();
@@ -722,6 +405,8 @@ private:
         };
 
         std::vector<Candidate> candidates;
+        cv::Mat R_prev_to_cur, t_prev_to_cur;
+        invertRigidTransform(R, t, R_prev_to_cur, t_prev_to_cur);
 
         for (const auto &pair : pixel_pairs)
         {
@@ -739,11 +424,6 @@ private:
             if (prev_set.empty() || cur_set.empty())
                 continue;
 
-            std::vector<cv::Point3d> prev_pred;
-            prev_pred.reserve(prev_set.size());
-            for (const PixelPoint &p_point : prev_set)
-                prev_pred.push_back(transformFeaturePointByPose(toPoint3f(p_point), R, t));
-
             for (const PixelPoint &q_point : cur_set)
             {
                 if (!std::isfinite(q_point.timestamp))
@@ -751,17 +431,17 @@ private:
 
                 double s = (q_point.timestamp - cur_ts_min) / cur_ts_span;
                 s = std::max(0.0, std::min(1.0, s));
-                const cv::Point3d q_deskew =
-                    deskewFeaturePointByPose(toPoint3f(q_point), s, alpha, R, t);
+                const cv::Point3d q_in_prev = mapCurrentFeatureToPreviousReference(
+                    toPoint3f(q_point), s, alpha, R, t, R_prev_to_cur, t_prev_to_cur);
 
                 size_t best_prev_idx = std::numeric_limits<size_t>::max();
                 double best_dist2 = std::numeric_limits<double>::infinity();
-                for (size_t p_idx = 0; p_idx < prev_pred.size(); ++p_idx)
+                for (size_t p_idx = 0; p_idx < prev_set.size(); ++p_idx)
                 {
-                    const cv::Point3d &p_pred = prev_pred[p_idx];
-                    const double dx = q_deskew.x - p_pred.x;
-                    const double dy = q_deskew.y - p_pred.y;
-                    const double dz = q_deskew.z - p_pred.z;
+                    const PixelPoint &p_ref = prev_set[p_idx];
+                    const double dx = q_in_prev.x - p_ref.x;
+                    const double dy = q_in_prev.y - p_ref.y;
+                    const double dz = q_in_prev.z - p_ref.z;
                     const double dist2 = dx * dx + dy * dy + dz * dz;
                     if (dist2 < best_dist2)
                     {
@@ -868,7 +548,7 @@ private:
         return P.size();
     }
 
-    double computeJointTguessDeskewRmse(const std::vector<cv::Point3f> &P,
+double LidarIntensityORBMatchDual::computeJointTguessDeskewRmse(const std::vector<cv::Point3f> &P,
                                         const std::vector<cv::Point3f> &Q,
                                         const std::vector<double> &Q_ts,
                                         double cur_ts_min,
@@ -876,7 +556,7 @@ private:
                                         double alpha,
                                         const cv::Mat &R,
                                         const cv::Mat &t) const
-    {
+{
         if (P.empty() || P.size() != Q.size() || Q_ts.size() != Q.size() ||
             !(cur_ts_span > 0.0))
         {
@@ -885,6 +565,8 @@ private:
 
         double sum_sq = 0.0;
         size_t used = 0;
+        cv::Mat R_prev_to_cur, t_prev_to_cur;
+        invertRigidTransform(R, t, R_prev_to_cur, t_prev_to_cur);
         for (size_t i = 0; i < P.size(); ++i)
         {
             if (!std::isfinite(Q_ts[i]))
@@ -892,11 +574,11 @@ private:
             double s = (Q_ts[i] - cur_ts_min) / cur_ts_span;
             s = std::max(0.0, std::min(1.0, s));
 
-            const cv::Point3d q_deskew = deskewFeaturePointByPose(Q[i], s, alpha, R, t);
-            const cv::Point3d p_pred = transformFeaturePointByPose(P[i], R, t);
-            const double dx = q_deskew.x - p_pred.x;
-            const double dy = q_deskew.y - p_pred.y;
-            const double dz = q_deskew.z - p_pred.z;
+            const cv::Point3d q_in_prev = mapCurrentFeatureToPreviousReference(
+                Q[i], s, alpha, R, t, R_prev_to_cur, t_prev_to_cur);
+            const double dx = q_in_prev.x - P[i].x;
+            const double dy = q_in_prev.y - P[i].y;
+            const double dz = q_in_prev.z - P[i].z;
             sum_sq += dx * dx + dy * dy + dz * dz;
             ++used;
         }
@@ -905,7 +587,7 @@ private:
         return std::sqrt(sum_sq / static_cast<double>(used));
     }
 
-    bool refineTguessWithJointDeskew(const std::vector<cv::Point3f> &P,
+bool LidarIntensityORBMatchDual::refineTguessWithJointDeskew(const std::vector<cv::Point3f> &P,
                                      const std::vector<cv::Point3f> &Q,
                                      const std::vector<double> &P_intensity,
                                      const std::vector<double> &Q_intensity,
@@ -919,13 +601,11 @@ private:
                                      double &rmse_after,
                                      size_t &used_out,
                                      int &iterations_out,
-                                     double &time_ms_out,
                                      bool &solution_usable_out) const
-    {
+{
         rmse_before = rmse_after = std::numeric_limits<double>::quiet_NaN();
         used_out = 0;
         iterations_out = 0;
-        time_ms_out = 0.0;
         solution_usable_out = false;
         if (!enable_joint_tguess_deskew_ ||
             P.size() != Q.size() ||
@@ -1000,12 +680,8 @@ private:
         options.num_threads = std::max(1, joint_tguess_num_threads_);
         options.minimizer_progress_to_stdout = false;
 
-        const auto t_opt_start = std::chrono::high_resolution_clock::now();
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
-        const auto t_opt_end = std::chrono::high_resolution_clock::now();
-        const double t_opt_ms = std::chrono::duration<double, std::milli>(t_opt_end - t_opt_start).count();
-        time_ms_out = t_opt_ms;
 
         cv::Mat rvec_opt = (cv::Mat_<double>(3, 1) << pose[0], pose[1], pose[2]);
         cv::Rodrigues(rvec_opt, R);
@@ -1015,19 +691,18 @@ private:
         iterations_out = static_cast<int>(summary.iterations.size());
         solution_usable_out = solution_usable;
 
-        ROS_INFO("Joint Tguess-deskew optimize objective: used=%zu alpha=%.3f rmse=%.4f->%.4f cost=%.6f->%.6f iters=%d time=%.3f ms status=%s",
+        ROS_INFO("Joint Tguess-deskew optimize objective: used=%zu alpha=%.3f rmse=%.4f->%.4f cost=%.6f->%.6f iters=%d status=%s",
                  used, alpha, rmse_before, rmse_after,
                  summary.initial_cost, summary.final_cost,
-                 static_cast<int>(summary.iterations.size()), t_opt_ms,
+                 static_cast<int>(summary.iterations.size()),
                  summary.BriefReport().c_str());
         return solution_usable;
     }
 
-    // ---------- 3D 刚体估计 ----------
-    bool estimateRigidSVD(const std::vector<cv::Point3f> &P,
+bool LidarIntensityORBMatchDual::estimateRigidSVD(const std::vector<cv::Point3f> &P,
                           const std::vector<cv::Point3f> &Q,
                           cv::Mat &R, cv::Mat &t)
-    {
+{
         if (P.size() < 3)
             return false;
         cv::Point3d meanP(0, 0, 0), meanQ(0, 0, 0);
@@ -1060,9 +735,9 @@ private:
         return true;
     }
 
-    inline void applyRT(const cv::Mat &R, const cv::Mat &t,
+void LidarIntensityORBMatchDual::applyRT(const cv::Mat &R, const cv::Mat &t,
                         const cv::Point3f &p, cv::Point3f &q) const
-    {
+{
         const double *r = (const double *)R.data;
         const double *tv = (const double *)t.data;
         double x = p.x, y = p.y, z = p.z;
@@ -1071,10 +746,10 @@ private:
         q.z = (float)(r[6] * x + r[7] * y + r[8] * z + tv[2]);
     }
 
-    std::vector<int> ransac3D(const std::vector<cv::Point3f> &P,
+std::vector<int> LidarIntensityORBMatchDual::ransac3D(const std::vector<cv::Point3f> &P,
                               const std::vector<cv::Point3f> &Q,
                               double thresh, int iters)
-    {
+{
         std::vector<int> best_inliers;
         if (P.size() < 3)
             return best_inliers;
@@ -1114,10 +789,10 @@ private:
         return best_inliers;
     }
 
-    std::vector<int> ransac3D_parallel(const std::vector<cv::Point3f> &P,
+std::vector<int> LidarIntensityORBMatchDual::ransac3D_parallel(const std::vector<cv::Point3f> &P,
                                        const std::vector<cv::Point3f> &Q,
                                        double thresh, int iters, int threads)
-    {
+{
         std::vector<int> best_global;
         if (P.size() < 3)
             return best_global;
@@ -1185,13 +860,33 @@ private:
         return best_global;
     }
 
-    cv::Mat buildMatchesStackedVisualization(const cv::Mat &prev_img, const cv::Mat &cur_img,
+void LidarIntensityORBMatchDual::drawImageLabel(cv::Mat &image_bgr, const std::string &text,
+                        int y_offset, const cv::Scalar &color) const
+{
+        if (text.empty())
+            return;
+
+        const int font = cv::FONT_HERSHEY_SIMPLEX;
+        const double font_scale = 0.35;
+        const int thickness = 1;
+        int baseline = 0;
+        cv::Size text_size = cv::getTextSize(text, font, font_scale, thickness, &baseline);
+        cv::Rect bg_rect(8, y_offset + 8, text_size.width + 16, text_size.height + baseline + 12);
+
+        cv::rectangle(image_bgr, bg_rect, cv::Scalar(20, 20, 20), cv::FILLED);
+        cv::rectangle(image_bgr, bg_rect, color, 1);
+        cv::putText(image_bgr, text,
+                    cv::Point(bg_rect.x + 8, bg_rect.y + text_size.height + 3),
+                    font, font_scale, color, thickness, cv::LINE_AA);
+    }
+
+cv::Mat LidarIntensityORBMatchDual::buildMatchesStackedVisualization(const cv::Mat &prev_img, const cv::Mat &cur_img,
                                              const std::vector<cv::KeyPoint> &prev_kp,
                                              const std::vector<cv::KeyPoint> &cur_kp,
                                              const std::vector<cv::DMatch> &matches,
                                              const std::string &prev_label,
                                              const std::string &cur_label)
-    {
+{
         cv::Mat prev_color, cur_color;
         cv::cvtColor(prev_img, prev_color, cv::COLOR_GRAY2BGR);
         cv::cvtColor(cur_img, cur_color, cv::COLOR_GRAY2BGR);
@@ -1204,27 +899,8 @@ private:
         cv::line(canvas, cv::Point(0, prev_color.rows), cv::Point(w - 1, prev_color.rows),
                  cv::Scalar(255, 255, 255), 2, cv::LINE_AA);
 
-        auto drawPanelLabel = [&](const std::string &text, int y_offset, const cv::Scalar &color)
-        {
-            if (text.empty())
-                return;
-
-            const int font = cv::FONT_HERSHEY_SIMPLEX;
-            const double font_scale = 0.35;
-            const int thickness = 1;
-            int baseline = 0;
-            cv::Size text_size = cv::getTextSize(text, font, font_scale, thickness, &baseline);
-            cv::Rect bg_rect(8, y_offset + 8, text_size.width + 16, text_size.height + baseline + 12);
-
-            cv::rectangle(canvas, bg_rect, cv::Scalar(20, 20, 20), cv::FILLED);
-            cv::rectangle(canvas, bg_rect, color, 1);
-            cv::putText(canvas, text,
-                        cv::Point(bg_rect.x + 8, bg_rect.y + text_size.height + 3),
-                        font, font_scale, color, thickness, cv::LINE_AA);
-        };
-
-        drawPanelLabel(prev_label, 0, cv::Scalar(0, 215, 255));
-        drawPanelLabel(cur_label, prev_color.rows, cv::Scalar(80, 255, 80));
+        drawImageLabel(canvas, prev_label, 0, cv::Scalar(0, 215, 255));
+        drawImageLabel(canvas, cur_label, prev_color.rows, cv::Scalar(80, 255, 80));
 
         const cv::Scalar match_color(0, 255, 0);
         const int match_radius = std::max(match_vis_radius_, 1);
@@ -1241,22 +917,36 @@ private:
         return canvas;
     }
 
-    bool shouldPublishImage(const ros::Publisher &publisher) const
-    {
-        return publish_match_images_ && publisher.getNumSubscribers() > 0;
+bool LidarIntensityORBMatchDual::shouldPublishImage(const ros::Publisher &publisher) const
+{
+        return publish_match_images_ &&
+               (latch_published_topics_ || publisher.getNumSubscribers() > 0);
     }
 
-    bool shouldPublishMatchedPointClouds() const
-    {
+bool LidarIntensityORBMatchDual::shouldPublishRawIntensityImage() const
+{
+        return publish_raw_intensity_image_ &&
+               (latch_published_topics_ || raw_intensity_image_pub_.getNumSubscribers() > 0);
+    }
+
+bool LidarIntensityORBMatchDual::shouldPublishEnhancedIntensityImage() const
+{
+        return publish_enhanced_intensity_image_ &&
+               (latch_published_topics_ || enhanced_intensity_image_pub_.getNumSubscribers() > 0);
+    }
+
+bool LidarIntensityORBMatchDual::shouldPublishMatchedPointClouds() const
+{
         return publish_matched_points_ &&
-               (matchedprev_points_pub_.getNumSubscribers() > 0 ||
+               (latch_published_topics_ ||
+                matchedprev_points_pub_.getNumSubscribers() > 0 ||
                 matchedcur_points_pub_.getNumSubscribers() > 0);
     }
 
-    void publishVisualizationImage(const cv::Mat &image,
+void LidarIntensityORBMatchDual::publishVisualizationImage(const cv::Mat &image,
                                    const std_msgs::Header &header,
                                    ros::Publisher &publisher)
-    {
+{
         if (image.empty())
             return;
 
@@ -1277,21 +967,50 @@ private:
         publisher.publish(msg);
     }
 
-    void publishMatchedORBImage(const cv::Mat &image, const std_msgs::Header &header)
-    {
+void LidarIntensityORBMatchDual::publishLabeledIntensityImage(const cv::Mat &image, const std::string &label,
+                                      const std_msgs::Header &header, ros::Publisher &publisher)
+{
+        if (image.empty() || image.type() != CV_8UC1)
+            return;
+
+        cv::Mat image_bgr;
+        cv::cvtColor(image, image_bgr, cv::COLOR_GRAY2BGR);
+        drawImageLabel(image_bgr, label, 0, cv::Scalar(80, 255, 80));
+        publishVisualizationImage(image_bgr, header, publisher);
+    }
+
+void LidarIntensityORBMatchDual::publishRawIntensityImage(const cv::Mat &image, const std::string &label,
+                                  const std_msgs::Header &header)
+{
+        publishLabeledIntensityImage(image, label, header, raw_intensity_image_pub_);
+    }
+
+void LidarIntensityORBMatchDual::publishEnhancedIntensityImage(const cv::Mat &image, const std::string &label,
+                                       const std_msgs::Header &header)
+{
+        publishLabeledIntensityImage(image, label, header, enhanced_intensity_image_pub_);
+    }
+
+void LidarIntensityORBMatchDual::publishMatchedORBImage(const cv::Mat &image, const std_msgs::Header &header)
+{
         publishVisualizationImage(image, header, matchedorb_image_pub_);
     }
 
-    void publishMatched3DImage(const cv::Mat &image, const std_msgs::Header &header)
-    {
+void LidarIntensityORBMatchDual::publishMatched2DImage(const cv::Mat &image, const std_msgs::Header &header)
+{
+        publishVisualizationImage(image, header, matched2d_image_pub_);
+    }
+
+void LidarIntensityORBMatchDual::publishMatched3DImage(const cv::Mat &image, const std_msgs::Header &header)
+{
         publishVisualizationImage(image, header, matched3d_image_pub_);
     }
 
-    sensor_msgs::PointCloud2 buildMatchedPointsCloud(const std::vector<cv::Point3f> &points,
+sensor_msgs::PointCloud2 LidarIntensityORBMatchDual::buildMatchedPointsCloud(const std::vector<cv::Point3f> &points,
                                                      const std::vector<double> &intensities,
                                                      const std::vector<double> &timestamps,
                                                      const std_msgs::Header &header) const
-    {
+{
         sensor_msgs::PointCloud2 cloud;
         cloud.header = header;
         cloud.height = 1;
@@ -1349,7 +1068,7 @@ private:
         return cloud;
     }
 
-    void publishMatched3DPointClouds(const std::vector<cv::Point3f> &prev_points,
+void LidarIntensityORBMatchDual::publishMatched3DPointClouds(const std::vector<cv::Point3f> &prev_points,
                                      const std::vector<cv::Point3f> &cur_points,
                                      const std::vector<double> &prev_intensities,
                                      const std::vector<double> &cur_intensities,
@@ -1357,7 +1076,7 @@ private:
                                      const std::vector<double> &cur_timestamps,
                                      const std_msgs::Header &prev_header,
                                      const std_msgs::Header &cur_header)
-    {
+{
         sensor_msgs::PointCloud2 prev_cloud =
             buildMatchedPointsCloud(prev_points, prev_intensities, prev_timestamps, prev_header);
         sensor_msgs::PointCloud2 cur_cloud =
@@ -1367,14 +1086,11 @@ private:
         matchedcur_points_pub_.publish(cur_cloud);
     }
 
-    bool filterOriginPoints(const sensor_msgs::PointCloud2 &in,
+bool LidarIntensityORBMatchDual::filterOriginPoints(const sensor_msgs::PointCloud2 &in,
                             sensor_msgs::PointCloud2 &out,
-                            size_t &removed_points,
-                            double &t_filter_ms) const
-    {
-        auto t0 = std::chrono::high_resolution_clock::now();
+                            size_t &removed_points) const
+{
         removed_points = 0;
-        t_filter_ms = 0.0;
 
         if (!filter_origin_points_)
             return false;
@@ -1451,9 +1167,6 @@ private:
             std::memcpy(out_data.data() + cur_off, p, point_step);
         }
 
-        auto t1 = std::chrono::high_resolution_clock::now();
-        t_filter_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-
         if (removed_points == 0)
             return false;
 
@@ -1464,25 +1177,20 @@ private:
         out.row_step = out.point_step * out.width;
         out.is_dense = false;
 
-        ROS_INFO("[Frame %d] origin point filter: points_in=%zu removed=%zu points_out=%u, time=%.3f ms",
-                 frame_idx_, num_points, removed_points, out.width, t_filter_ms);
+        ROS_INFO("[Frame %d] origin point filter: points_in=%zu removed=%zu points_out=%u",
+                 frame_idx_, num_points, removed_points, out.width);
         return true;
     }
 
-    // ---------- 线束采样：按 ring 选择部分线束并输出新点云（只用于发布） ----------
-    bool samplePointCloudByRing(const sensor_msgs::PointCloud2 &in,
-                                sensor_msgs::PointCloud2 &out,
-                                double &t_sample_ms)
-    {
-        auto t0 = std::chrono::high_resolution_clock::now();
-        t_sample_ms = 0.0;
-
+bool LidarIntensityORBMatchDual::samplePointCloudByRing(const sensor_msgs::PointCloud2 &in,
+                                sensor_msgs::PointCloud2 &out)
+{
         if (!enable_line_sampling_ ||
             target_lines_ >= source_lines_ ||
             target_lines_ <= 0 ||
             source_lines_ <= 0)
         {
-            return false; // 不采样
+            return false; // no sampling
         }
         if (source_lines_ % target_lines_ != 0)
         {
@@ -1492,7 +1200,7 @@ private:
             return false;
         }
 
-        // 找 ring 字段
+        // locate the ring field
         int offset_ring = -1;
         int ring_datatype = -1;
         for (const auto &f : in.fields)
@@ -1511,7 +1219,7 @@ private:
             return false;
         }
 
-        // 可选：过滤 NaN/占位点（(0,0,0)）和过近点，避免输出给 LOAM 后出问题
+        // Optional: drop NaN/placeholder points ((0,0,0)) and near-origin points so downstream LOAM is not disturbed
         bool filter_invalid = sampling_filter_invalid_;
         int offset_x = -1, offset_y = -1, offset_z = -1;
         if (filter_invalid)
@@ -1576,7 +1284,7 @@ private:
                 continue;
             int new_ring = ring_to_new[ring];
             if (new_ring < 0)
-                continue; // 该线束未被选中
+                continue; // this beam is not selected
 
             if (filter_invalid)
             {
@@ -1620,34 +1328,28 @@ private:
             ++kept_points;
         }
 
-        auto t1 = std::chrono::high_resolution_clock::now();
-        t_sample_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-
         if (kept_points == 0)
         {
             ROS_WARN_THROTTLE(1.0, "line sampling produced empty cloud.");
             return false;
         }
 
-        out = in; // 拷贝元信息
+        out = in; // copy metadata
         out.data.swap(out_data);
         out.width = kept_points;
         out.height = 1;
         out.row_step = out.point_step * out.width;
 
-        ROS_INFO("[Frame %d] line sampling (publish only): points_in=%zu points_out=%zu, time=%.3f ms",
-                 frame_idx_, num_points, kept_points, t_sample_ms);
+        ROS_INFO("[Frame %d] line sampling (publish only): points_in=%zu points_out=%zu",
+                 frame_idx_, num_points, kept_points);
 
         return true;
     }
 
-    // ---------- timestamp 统计（用于 deskew 时间缩放） ----------
-    // 从 PointCloud2 的 per-point "timestamp"(float64) 统计 ts_min/ts_max，并给出 mid/span
-    // 过滤规则与 deskew 一致：跳过 NaN、(0,0,0) 占位点、过近点
-    bool computeCloudTimestampStats(const sensor_msgs::PointCloud2 &cloud,
+bool LidarIntensityORBMatchDual::computeCloudTimestampStats(const sensor_msgs::PointCloud2 &cloud,
                                     double &ts_min, double &ts_max,
                                     double &ts_mid, double &ts_span) const
-    {
+{
         ts_min = std::numeric_limits<double>::infinity();
         ts_max = -std::numeric_limits<double>::infinity();
         ts_mid = std::numeric_limits<double>::quiet_NaN();
@@ -1723,12 +1425,9 @@ private:
         return std::isfinite(ts_mid);
     }
 
-    // ---------- SE(3) 时间缩放：把“跨帧 Tguess”缩放成“单帧 scan 内运动” ----------
-    // 匀速假设下：Twist * dt，故 se(3) 的 log 可线性按时间缩放
-    // 这里用近似：R_scaled = Exp(alpha * log(R)), t_scaled = alpha * t
-    static inline void scaleTransformByTime(const cv::Mat &R_in, const cv::Mat &t_in,
+void LidarIntensityORBMatchDual::scaleTransformByTime(const cv::Mat &R_in, const cv::Mat &t_in,
                                             double alpha, cv::Mat &R_out, cv::Mat &t_out)
-    {
+{
         if (!std::isfinite(alpha))
             alpha = 1.0;
         if (std::fabs(alpha - 1.0) < 1e-6)
@@ -1744,21 +1443,10 @@ private:
         t_out = t_in * alpha;
     }
 
-    // ---------- 点云畸变矫正：使用每点 timestamp + Tguess（匀速模型） ----------
-    // 说明：
-    //  - 需要 PointCloud2 中存在字段：x/y/z/timestamp（timestamp 为 float64）
-    //  - 使用 Tguess (R_end, t_end) 近似一帧扫描周期内的 start->end 运动
-    //  - 对每个点根据 s = (ts - ts_min) / (ts_max - ts_min) 插值得到局部运动，再把点补偿回 scan start
-    //
-    // deskew 输出将原地修改 cloud.data 内的 x/y/z（其他字段保持不变）
-    bool deskewPointCloudInPlaceTimestamp(sensor_msgs::PointCloud2 &cloud,
+bool LidarIntensityORBMatchDual::deskewPointCloudInPlaceTimestamp(sensor_msgs::PointCloud2 &cloud,
                                           const cv::Mat &R_end_in,
-                                          const cv::Mat &t_end_in,
-                                          double &t_deskew_ms)
-    {
-        auto t0 = std::chrono::high_resolution_clock::now();
-        t_deskew_ms = 0.0;
-
+                                          const cv::Mat &t_end_in)
+{
         if (!enable_deskew_current_)
             return false;
 
@@ -1766,7 +1454,7 @@ private:
         if (num_points == 0 || cloud.data.empty())
             return false;
 
-        // 找字段 offset（注意：AT128 的 point_step 可能不是 4/8 对齐，必须用 memcpy 读写）
+        // Locate the field offsets (note: the AT128 point_step is not necessarily 4/8-byte aligned, so memcpy must be used)
         int offset_x = -1, offset_y = -1, offset_z = -1, offset_ts = -1;
         int dtype_ts = -1;
         for (const auto &f : cloud.fields)
@@ -1806,7 +1494,7 @@ private:
 
         uint8_t *base_ptr = cloud.data.data();
 
-        // 1) 统计当前帧 timestamp 范围（忽略无效点）
+        // 1) Collect the timestamp range of the current frame (invalid points ignored)
         double ts_min = std::numeric_limits<double>::infinity();
         double ts_max = -std::numeric_limits<double>::infinity();
         size_t valid_for_span = 0;
@@ -1849,15 +1537,13 @@ private:
         }
         const double ts_span = ts_max - ts_min;
 
-        // 2) 预计算旋转 axis-angle（log(R_end)）
+        // 2) Precompute the rotation axis-angle (log(R_end))
         cv::Mat R_end = R_end_in;
         cv::Mat t_end = t_end_in;
         if (deskew_use_inverse_tguess_)
         {
-            cv::Mat R_inv = R_end.t();
-            cv::Mat t_inv = -R_inv * t_end;
-            R_end = R_inv;
-            t_end = t_inv;
+            ROS_WARN_THROTTLE(1.0,
+                              "deskew_use_inverse_tguess is deprecated and ignored: deskew always receives T(prev->cur).");
         }
 
         cv::Mat rvec_end;
@@ -1883,7 +1569,7 @@ private:
         const float nan_f = std::numeric_limits<float>::quiet_NaN();
         size_t nan_written = 0;
 
-        // 3) 第二遍：逐点 deskew
+        // 3) Second pass: deskew every point
         for (size_t idx = 0; idx < num_points; ++idx)
         {
             uint8_t *p = base_ptr + idx * point_step;
@@ -1897,7 +1583,7 @@ private:
                 (std::fabs(xf) + std::fabs(yf) + std::fabs(zf) < eps_l1) ||
                 (xf * xf + yf * yf + zf * zf < min_range2))
             {
-                // 无效/占位点：写 NaN，避免 deskew 后形成“原点射线”
+                // Invalid/placeholder point: write NaN so deskewing does not produce "origin rays"
                 std::memcpy(p + offset_x, &nan_f, sizeof(float));
                 std::memcpy(p + offset_y, &nan_f, sizeof(float));
                 std::memcpy(p + offset_z, &nan_f, sizeof(float));
@@ -1922,12 +1608,12 @@ private:
             if (s > 1.0)
                 s = 1.0;
 
-            // 平移插值：t(s) = s * t_end
+            // Translation interpolation: t(s) = s * t_end
             const double tsx = s * tx;
             const double tsy = s * ty;
             const double tsz = s * tz;
 
-            // 旋转插值：R(s) = Exp(s * log(R_end))，用 axis-angle -> quaternion
+            // Rotation interpolation: R(s) = Exp(s * log(R_end)), via axis-angle -> quaternion
             double w = 1.0, qx = 0.0, qy = 0.0, qz = 0.0;
             if (angle_end > 1e-12)
             {
@@ -1939,13 +1625,13 @@ private:
                 qz = az * sh;
             }
 
-            // 先减平移：v = p - t(s)
+            // Subtract the translation first: v = p - t(s)
             double vx = (double)xf - tsx;
             double vy = (double)yf - tsy;
             double vz = (double)zf - tsz;
 
-            // deskew 到 scan start：p_start = R(s)^T * (p - t(s))
-            // 即 v_rot = q_conj * v * q，其中 q_conj = (w, -qx, -qy, -qz)
+            // Deskew back to the scan start: p_start = R(s)^T * (p - t(s))
+            // i.e. v_rot = q_conj * v * q, with q_conj = (w, -qx, -qy, -qz)
             const double cx = -qx, cy = -qy, cz = -qz;
 
             // t = 2 * cross(c, v)
@@ -1967,16 +1653,13 @@ private:
             std::memcpy(p + offset_z, &zo, sizeof(float));
         }
 
-        auto t1 = std::chrono::high_resolution_clock::now();
-        t_deskew_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        ROS_INFO("[Frame %d] deskew(current,Tguess): points=%zu nan_written=%zu span=%.6f time=%.3f ms",
-                 frame_idx_, num_points, nan_written, ts_span, t_deskew_ms);
+        ROS_INFO("[Frame %d] deskew(current,Tguess): points=%zu nan_written=%zu span=%.6f",
+                 frame_idx_, num_points, nan_written, ts_span);
 
         return true;
     }
 
-    // ---------- 投影模式 1：angle（az + el） ----------
-    void buildIntensityImageAngle(
+void LidarIntensityORBMatchDual::buildIntensityImageAngle(
         const sensor_msgs::PointCloud2 &cloud,
         cv::Mat &intensity_f,
         std::vector<float> &pixel_x,
@@ -1985,17 +1668,11 @@ private:
         std::vector<float> &pixel_intensity,
         std::vector<double> &pixel_timestamp,
         std::vector<std::vector<PixelPoint>> &pixel_points,
-        std::vector<char> &has_point,
-        double &t_offset_ms,
-        double &t_project_ms,
-        double &t_merge_ms)
-    {
-        auto t_off_start = std::chrono::high_resolution_clock::now();
-
+        std::vector<char> &has_point)
+{
         const size_t num_points = (size_t)cloud.width * cloud.height;
         if (num_points == 0)
         {
-            t_offset_ms = t_project_ms = t_merge_ms = 0.0;
             intensity_f.release();
             pixel_x.clear();
             pixel_y.clear();
@@ -2029,7 +1706,6 @@ private:
         if (offset_x < 0 || offset_y < 0 || offset_z < 0 || offset_i < 0)
         {
             ROS_ERROR("buildIntensityImageAngle: x/y/z/intensity fields not all found.");
-            t_offset_ms = t_project_ms = t_merge_ms = 0.0;
             intensity_f.release();
             pixel_x.clear();
             pixel_y.clear();
@@ -2044,11 +1720,7 @@ private:
         const uint8_t *base_ptr = cloud.data.data();
         const size_t point_step = cloud.point_step;
 
-        auto t_off_end = std::chrono::high_resolution_clock::now();
-        t_offset_ms = std::chrono::duration<double, std::milli>(t_off_end - t_off_start).count();
-
         // ---- project ----
-        auto t_proj_start = std::chrono::high_resolution_clock::now();
 
         const int v_res = v_res_;
         const int h_res = h_res_;
@@ -2126,7 +1798,10 @@ private:
                 if (az < min_az_ || az > max_az_ || el < min_el_ || el > max_el_)
                     continue;
 
-                double uf = (az - min_az_) / (max_az_ - min_az_) * (h_res - 1);
+                // AT128 packet timestamps increase from +azimuth to -azimuth.
+                // Reverse the spatial azimuth axis so image columns follow the
+                // physical scan order: left (early) -> right (late).
+                double uf = (max_az_ - az) / (max_az_ - min_az_) * (h_res - 1);
                 double vf = (max_el_ - el) / (max_el_ - min_el_) * (v_res - 1);
 
                 int u = (int)std::round(uf);
@@ -2151,11 +1826,7 @@ private:
             }
         }
 
-        auto t_proj_end = std::chrono::high_resolution_clock::now();
-        t_project_ms = std::chrono::duration<double, std::milli>(t_proj_end - t_proj_start).count();
-
         // ---- merge ----
-        auto t_merge_start = std::chrono::high_resolution_clock::now();
 
         std::vector<PixAcc> global_grid(total_pix);
         for (int t = 0; t < omp_threads; ++t)
@@ -2179,9 +1850,6 @@ private:
             }
         }
         materializePixelPointBuckets(total_pix, thread_point_records, pixel_points);
-
-        auto t_merge_end = std::chrono::high_resolution_clock::now();
-        t_merge_ms = std::chrono::duration<double, std::milli>(t_merge_end - t_merge_start).count();
 
         // ---- output ----
         intensity_f = cv::Mat(v_res, h_res, CV_32F, cv::Scalar(0.0f));
@@ -2210,8 +1878,7 @@ private:
         }
     }
 
-    // ---------- 投影模式 2：ring + azimuth ----------
-    void buildIntensityImageRing(
+void LidarIntensityORBMatchDual::buildIntensityImageRing(
         const sensor_msgs::PointCloud2 &cloud,
         cv::Mat &intensity_f,
         std::vector<float> &pixel_x,
@@ -2220,17 +1887,11 @@ private:
         std::vector<float> &pixel_intensity,
         std::vector<double> &pixel_timestamp,
         std::vector<std::vector<PixelPoint>> &pixel_points,
-        std::vector<char> &has_point,
-        double &t_offset_ms,
-        double &t_project_ms,
-        double &t_merge_ms)
-    {
-        auto t_off_start = std::chrono::high_resolution_clock::now();
-
+        std::vector<char> &has_point)
+{
         const size_t num_points = (size_t)cloud.width * cloud.height;
         if (num_points == 0)
         {
-            t_offset_ms = t_project_ms = t_merge_ms = 0.0;
             intensity_f.release();
             pixel_x.clear();
             pixel_y.clear();
@@ -2271,7 +1932,6 @@ private:
         if (offset_x < 0 || offset_y < 0 || offset_z < 0 || offset_i < 0 || offset_ring < 0)
         {
             ROS_ERROR("buildIntensityImageRing: x/y/z/intensity/ring fields not all found.");
-            t_offset_ms = t_project_ms = t_merge_ms = 0.0;
             intensity_f.release();
             pixel_x.clear();
             pixel_y.clear();
@@ -2286,11 +1946,7 @@ private:
         const uint8_t *base_ptr = cloud.data.data();
         const size_t point_step = cloud.point_step;
 
-        auto t_off_end = std::chrono::high_resolution_clock::now();
-        t_offset_ms = std::chrono::duration<double, std::milli>(t_off_end - t_off_start).count();
-
         // ---- project ----
-        auto t_proj_start = std::chrono::high_resolution_clock::now();
 
         const int v_res = v_res_;
         const int h_res = h_res_;
@@ -2386,9 +2042,11 @@ private:
                 if (az < min_az_ || az > max_az_)
                     continue;
 
-                double uf = (az - min_az_) / (max_az_ - min_az_) * (h_res - 1);
+                // Keep ring projection horizontally consistent with AT128's
+                // timestamp order: +azimuth at the first (left) image column.
+                double uf = (max_az_ - az) / (max_az_ - min_az_) * (h_res - 1);
                 int u = (int)std::round(uf);
-                int v = ring; // 行 = ring
+                int v = ring; // row = ring
 
                 if (u < 0 || u >= h_res || v < 0 || v >= v_res)
                     continue;
@@ -2410,11 +2068,7 @@ private:
             }
         }
 
-        auto t_proj_end = std::chrono::high_resolution_clock::now();
-        t_project_ms = std::chrono::duration<double, std::milli>(t_proj_end - t_proj_start).count();
-
         // ---- merge ----
-        auto t_merge_start = std::chrono::high_resolution_clock::now();
 
         std::vector<PixAcc> global_grid(total_pix);
         for (int t = 0; t < omp_threads; ++t)
@@ -2438,9 +2092,6 @@ private:
             }
         }
         materializePixelPointBuckets(total_pix, thread_point_records, pixel_points);
-
-        auto t_merge_end = std::chrono::high_resolution_clock::now();
-        t_merge_ms = std::chrono::duration<double, std::milli>(t_merge_end - t_merge_start).count();
 
         // ---- output ----
         intensity_f = cv::Mat(v_res, h_res, CV_32F, cv::Scalar(0.0f));
@@ -2469,19 +2120,88 @@ private:
         }
     }
 
-    // ---------- 回调 ----------
-    void callback(const sensor_msgs::PointCloud2ConstPtr &msg)
-    {
+bool LidarIntensityORBMatchDual::rebuildFeatureCacheFromDeskewedCloud(
+        const sensor_msgs::PointCloud2 &cloud,
+        cv::Mat &image_out,
+        cv::Mat &descriptors_out,
+        std::vector<cv::KeyPoint> &keypoints_out,
+        std::vector<float> &pixel_x_out,
+        std::vector<float> &pixel_y_out,
+        std::vector<float> &pixel_z_out,
+        std::vector<float> &pixel_intensity_out,
+        std::vector<double> &pixel_timestamp_out,
+        std::vector<std::vector<PixelPoint>> &pixel_points_out,
+        std::vector<char> &has_point_out)
+{
+        cv::Mat intensity_f;
+        if (projection_mode_ == "ring")
+        {
+            buildIntensityImageRing(cloud, intensity_f,
+                                    pixel_x_out, pixel_y_out, pixel_z_out,
+                                    pixel_intensity_out, pixel_timestamp_out,
+                                    pixel_points_out, has_point_out);
+        }
+        else
+        {
+            buildIntensityImageAngle(cloud, intensity_f,
+                                     pixel_x_out, pixel_y_out, pixel_z_out,
+                                     pixel_intensity_out, pixel_timestamp_out,
+                                     pixel_points_out, has_point_out);
+        }
+
+        if (intensity_f.empty())
+            return false;
+
+        cv::Mat intensity_raw;
+        cv::normalize(intensity_f, intensity_raw, 0, 255, cv::NORM_MINMAX, CV_8U);
+        image_out = intensity_raw;
+
+        cv::Mat intensity_equalize;
+        cv::Mat intensity_clahe;
+        if (contrast_mode_ == "clahe" || contrast_mode_ == "equalize")
+        {
+            cv::equalizeHist(intensity_raw, intensity_equalize);
+            cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(3.0, cv::Size(8, 8));
+            clahe->apply(intensity_raw, intensity_clahe);
+            if (contrast_mode_ == "clahe")
+                image_out = intensity_clahe;
+            else
+                image_out = intensity_equalize;
+        }
+        if (enable_blur_)
+            cv::GaussianBlur(image_out, image_out, cv::Size(3, 3), 0);
+        if (enable_bilateral_filter_)
+        {
+            int bilateral_d = std::max(1, bilateral_d_);
+            if ((bilateral_d % 2) == 0)
+                ++bilateral_d;
+            cv::Mat bilateral_image;
+            cv::bilateralFilter(image_out, bilateral_image, bilateral_d,
+                                std::max(0.0, bilateral_sigma_color_),
+                                std::max(0.0, bilateral_sigma_space_));
+            image_out = bilateral_image;
+        }
+
+        cv::Ptr<cv::ORB> orb = cv::ORB::create(
+            orb_nfeatures_, static_cast<float>(orb_scaleFactor_), orb_nlevels_,
+            orb_edgeThreshold_, 0, orb_wta_k_, orb_score_type_,
+            orb_patchSize_, orb_fastThreshold_);
+        orb->detectAndCompute(image_out, cv::noArray(), keypoints_out, descriptors_out);
+
+        ROS_INFO("[Frame %d] rebuilt corrected feature cache: orb_features=%zu",
+                 frame_idx_, keypoints_out.size());
+        return true;
+    }
+
+void LidarIntensityORBMatchDual::callback(const sensor_msgs::PointCloud2ConstPtr &msg)
+{
         if (!msg || msg->data.empty())
             return;
 
-        auto t_total_start = std::chrono::high_resolution_clock::now();
-
         sensor_msgs::PointCloud2 filtered_cloud;
         size_t removed_origin_points = 0;
-        double t_origin_filter_ms = 0.0;
         const sensor_msgs::PointCloud2 *cloud_in = msg.get();
-        if (filterOriginPoints(*msg, filtered_cloud, removed_origin_points, t_origin_filter_ms))
+        if (filterOriginPoints(*msg, filtered_cloud, removed_origin_points))
         {
             cloud_in = &filtered_cloud;
             if (cloud_in->data.empty() || (size_t)cloud_in->width * (size_t)cloud_in->height == 0)
@@ -2491,14 +2211,14 @@ private:
             }
         }
 
-        // 0) 统计当前帧 per-point timestamp 范围（用于 deskew 时间缩放）
+        // 0) Collect the per-point timestamp range of the current frame (for deskew time scaling)
         double cur_ts_min = 0.0, cur_ts_max = 0.0, cur_ts_mid = 0.0, cur_ts_span = 0.0;
         bool cur_ts_ok = computeCloudTimestampStats(*cloud_in, cur_ts_min, cur_ts_max, cur_ts_mid, cur_ts_span);
         double deskew_time_alpha = 1.0;
         bool deskew_time_alpha_valid = false;
-        if (deskew_scale_by_time_ && cur_ts_ok && prev_scan_mid_valid_)
+        if (deskew_scale_by_time_ && cur_ts_ok && prev_scan_start_valid_)
         {
-            const double dt_guess = cur_ts_mid - prev_scan_mid_ts_; // 与 timestamp 同单位（秒或纳秒都可）
+            const double dt_guess = cur_ts_min - prev_scan_start_ts_; // start-to-start, same unit as timestamp (seconds or nanoseconds)
             if (std::isfinite(dt_guess) && dt_guess > 1e-12 && std::isfinite(cur_ts_span) && cur_ts_span > 0.0)
             {
                 deskew_time_alpha = cur_ts_span / dt_guess;
@@ -2516,20 +2236,14 @@ private:
             deskew_time_alpha_valid = cur_ts_ok;
         }
 
-        // 0) 线束采样（只用于发布，不用于投影）
-        double t_sample_ms = 0.0;
+        // 0) Beam sampling (publish only, not used for projection)
         sensor_msgs::PointCloud2 sampled_cloud;
 
-        // 0.1) 当前帧 Tguess（由图像匹配得到），用于对“当前帧”做匀速 deskew（预测式）
+        // 0.1) Current-frame Tguess (from image matching), used for the predictive constant-velocity deskew of the current frame
         bool got_tguess = false;
-        cv::Mat Rfit_this, tfit_this; // prev->cur
-        double t_deskew_ms = 0.0;
+        cv::Mat Rfit_this, tfit_this; // cur->prev
 
-        // ---------- 1) 投影：使用过滤后的当前帧点云 ----------
-        double t_off_ms = 0.0, t_proj_inner_ms = 0.0, t_merge_ms = 0.0, t_norm_ms = 0.0;
-
-        auto t_proj_start = std::chrono::high_resolution_clock::now();
-
+        // ---------- 1) Projection: use the filtered current-frame cloud ----------
         cv::Mat intensity_f;
         std::vector<float> pixel_x, pixel_y, pixel_z;
         std::vector<float> pixel_intensity;
@@ -2542,42 +2256,30 @@ private:
             buildIntensityImageRing(*cloud_in,
                                     intensity_f,
                                     pixel_x, pixel_y, pixel_z,
-                                    pixel_intensity, pixel_timestamp, pixel_points, has_point,
-                                    t_off_ms, t_proj_inner_ms, t_merge_ms);
+                                    pixel_intensity, pixel_timestamp, pixel_points, has_point);
         }
         else
         {
             buildIntensityImageAngle(*cloud_in,
                                      intensity_f,
                                      pixel_x, pixel_y, pixel_z,
-                                     pixel_intensity, pixel_timestamp, pixel_points, has_point,
-                                     t_off_ms, t_proj_inner_ms, t_merge_ms);
+                                     pixel_intensity, pixel_timestamp, pixel_points, has_point);
         }
 
         cv::Mat intensity_raw_8u;
-        auto t_norm_start = std::chrono::high_resolution_clock::now();
         if (!intensity_f.empty())
         {
             cv::normalize(intensity_f, intensity_raw_8u, 0, 255, cv::NORM_MINMAX, CV_8U);
-            if (save_image_results_)
+            if (shouldPublishRawIntensityImage())
             {
-                std::string raw_path = outputPath("intensity_raw", "intensity_raw_" + std::to_string(frame_idx_) + ".png");
-                cv::imwrite(raw_path, intensity_raw_8u);
+                const std::string label = show_match_labels_
+                                              ? "Current Frame #" + std::to_string(frame_idx_)
+                                              : "";
+                publishRawIntensityImage(intensity_raw_8u, label, msg->header);
+                ROS_INFO("Published raw intensity image: %s", raw_intensity_image_topic_.c_str());
             }
         }
-        auto t_norm_end = std::chrono::high_resolution_clock::now();
-        t_norm_ms = std::chrono::duration<double, std::milli>(t_norm_end - t_norm_start).count();
-
-        auto t_proj_end = std::chrono::high_resolution_clock::now();
-        double t_proj_ms = std::chrono::duration<double, std::milli>(t_proj_end - t_proj_start).count();
-
-        ROS_INFO("[Frame %d] Projection(%s) breakdown (ms): offset=%.3f project=%.3f merge=%.3f normalize=%.3f total=%.3f",
-                 frame_idx_, projection_mode_.c_str(),
-                 t_off_ms, t_proj_inner_ms, t_merge_ms, t_norm_ms, t_proj_ms);
-
-        // ---------- 2) 图像增强 ----------
-        auto t_enh_start = std::chrono::high_resolution_clock::now();
-
+        // ---------- 2) Image enhancement ----------
         cv::Mat intensity_equalize;
         cv::Mat intensity_clahe;
         cv::Mat intensity_bilateral;
@@ -2613,35 +2315,16 @@ private:
             intensity_enh = intensity_bilateral.clone();
         }
 
-        if (save_image_results_)
+        if (shouldPublishEnhancedIntensityImage())
         {
-            if (!intensity_equalize.empty())
-            {
-                std::string equalize_path = outputPath("intensity_equalize", "intensity_equalize_" + std::to_string(frame_idx_) + ".png");
-                cv::imwrite(equalize_path, intensity_equalize);
-            }
-            if (!intensity_clahe.empty())
-            {
-                std::string clahe_path = outputPath("intensity_clahe", "intensity_clahe_" + std::to_string(frame_idx_) + ".png");
-                cv::imwrite(clahe_path, intensity_clahe);
-            }
-            if (!intensity_bilateral.empty())
-            {
-                std::string bilateral_path = outputPath("intensity_bilateral", "intensity_bilateral_" + std::to_string(frame_idx_) + ".png");
-                cv::imwrite(bilateral_path, intensity_bilateral);
-            }
-            if (!intensity_enh.empty())
-            {
-                std::string enh_path = outputPath("intensity_enh", "intensity_enh_" + std::to_string(frame_idx_) + ".png");
-                cv::imwrite(enh_path, intensity_enh);
-            }
+            const std::string label = show_match_labels_
+                                          ? "Current Frame #" + std::to_string(frame_idx_)
+                                          : "";
+            publishEnhancedIntensityImage(intensity_enh, label, msg->header);
+            ROS_INFO("Published enhanced intensity image: %s", enhanced_intensity_image_topic_.c_str());
         }
 
-        auto t_enh_end = std::chrono::high_resolution_clock::now();
-        double t_enh_ms = std::chrono::duration<double, std::milli>(t_enh_end - t_enh_start).count();
-
         // ---------- 3) ORB ----------
-        auto t_orb_start = std::chrono::high_resolution_clock::now();
 
         cv::Ptr<cv::ORB> orb = cv::ORB::create(orb_nfeatures_, (float)orb_scaleFactor_, orb_nlevels_,
                                                orb_edgeThreshold_, 0, orb_wta_k_, orb_score_type_,
@@ -2657,35 +2340,11 @@ private:
             ROS_WARN("[Frame %d] intensity image is empty; skip ORB detection", frame_idx_);
         }
 
-        if (save_image_results_ && !intensity_enh.empty())
-        {
-            cv::Mat orb_vis;
-            cv::cvtColor(intensity_enh, orb_vis, cv::COLOR_GRAY2BGR);
-            for (const auto &kp : keypoints)
-            {
-                cv::circle(orb_vis, kp.pt,
-                           std::max(orb_vis_radius_, 1),
-                           cv::Scalar(0, 255, 0),
-                           std::max(orb_vis_thickness_, 1),
-                           cv::LINE_AA);
-            }
-            cv::imwrite(outputPath("orb_vis", "orb_vis_" + std::to_string(frame_idx_) + ".png"), orb_vis);
-        }
-
-        auto t_orb_end = std::chrono::high_resolution_clock::now();
-        double t_orb_ms = std::chrono::duration<double, std::milli>(t_orb_end - t_orb_start).count();
-
-        // ---------- 4) 匹配 + RANSAC ----------
-        double t_match_ms = 0.0, t_ransac2d_ms = 0.0, t_ransac3d_ms = 0.0;
-        double t_match_bf_ms = 0.0, t_match_orb_vis_ms = 0.0, t_match_2d_vis_ms = 0.0;
-        double t_match_prepare3d_ms = 0.0, t_match_collect_io_ms = 0.0, t_match_3d_vis_ms = 0.0;
-        double t_match_joint_pair_ms = 0.0, t_match_joint_opt_ms = 0.0;
-        size_t count_2d_inliers = 0, count_3d_inliers = 0;
+        // ---------- 4) Matching + RANSAC ----------
+        size_t count_orb_matches = 0, count_2d_inliers = 0, count_3d_inliers = 0;
 
         if (has_prev_frame_ && !descriptors.empty() && !prev_desc_.empty())
         {
-            auto t_match_start = std::chrono::high_resolution_clock::now();
-
             cv::BFMatcher matcher(cv::NORM_HAMMING);
             std::vector<std::vector<cv::DMatch>> knn_matches;
             matcher.knnMatch(prev_desc_, descriptors, knn_matches, 2);
@@ -2705,13 +2364,11 @@ private:
                 if (m.distance <= hamming_thresh_)
                     dist_pass.push_back(m);
             }
-            auto t_bf_end = std::chrono::high_resolution_clock::now();
-            t_match_bf_ms = std::chrono::duration<double, std::milli>(t_bf_end - t_match_start).count();
+            count_orb_matches = dist_pass.size();
 
             {
-                auto t_orb_vis_start = std::chrono::high_resolution_clock::now();
                 const bool publish_orb_image = shouldPublishImage(matchedorb_image_pub_);
-                const bool need_orb_vis = save_image_results_ || publish_orb_image;
+                const bool need_orb_vis = publish_orb_image;
                 const std::string prev_label = show_match_labels_
                                                    ? "Prev Frame #" + std::to_string(frame_idx_ - 1)
                                                    : "";
@@ -2729,19 +2386,8 @@ private:
                                  matched_orb_image_topic_.c_str(), dist_pass.size());
                     }
 
-                    if (save_image_results_)
-                    {
-                        std::string vis_orb_path = outputPath("match_orb", "match_orb_" + std::to_string(frame_idx_) + ".png");
-                        cv::imwrite(vis_orb_path, vis_orb);
-                        ROS_INFO("Saved ORB match visualization: %s (matches=%zu)", vis_orb_path.c_str(), dist_pass.size());
-                    }
                 }
-                auto t_orb_vis_end = std::chrono::high_resolution_clock::now();
-                t_match_orb_vis_ms = std::chrono::duration<double, std::milli>(t_orb_vis_end - t_orb_vis_start).count();
             }
-
-            auto t_match_end1 = std::chrono::high_resolution_clock::now();
-            t_match_ms = std::chrono::duration<double, std::milli>(t_match_end1 - t_match_start).count();
 
             std::vector<cv::Point2f> pts_prev, pts_cur;
             pts_prev.reserve(dist_pass.size());
@@ -2756,8 +2402,6 @@ private:
 
             if (enable_ransac_2d_ && pts_prev.size() >= 8)
             {
-                auto t_r2_start = std::chrono::high_resolution_clock::now();
-
                 std::vector<uchar> mask2d;
                 cv::Mat H = cv::findHomography(pts_prev, pts_cur,
                                                cv::RANSAC,
@@ -2772,36 +2416,37 @@ private:
                         matches_2d_inliers.push_back(dist_pass[i]);
                 }
 
-                auto t_r2_end = std::chrono::high_resolution_clock::now();
-                t_ransac2d_ms = std::chrono::duration<double, std::milli>(t_r2_end - t_r2_start).count();
             }
             else
             {
                 matches_2d_inliers = dist_pass;
-                t_ransac2d_ms = 0.0;
             }
 
             count_2d_inliers = matches_2d_inliers.size();
 
-            if (save_image_results_)
             {
-                auto t_2d_vis_start = std::chrono::high_resolution_clock::now();
-                const std::string prev_label = show_match_labels_
-                                                   ? "Prev Frame #" + std::to_string(frame_idx_ - 1)
-                                                   : "";
-                const std::string cur_label = show_match_labels_
-                                                  ? "Current Frame #" + std::to_string(frame_idx_)
-                                                  : "";
-                std::string vis2d_path = outputPath("match_2d", "match_2d_" + std::to_string(frame_idx_) + ".png");
-                cv::Mat vis2d = buildMatchesStackedVisualization(prev_img_, intensity_enh, prev_kp_, keypoints,
-                                                                 matches_2d_inliers, prev_label, cur_label);
-                cv::imwrite(vis2d_path, vis2d);
-                ROS_INFO("Saved 2D visualization: %s (inliers=%zu)", vis2d_path.c_str(), matches_2d_inliers.size());
-                auto t_2d_vis_end = std::chrono::high_resolution_clock::now();
-                t_match_2d_vis_ms = std::chrono::duration<double, std::milli>(t_2d_vis_end - t_2d_vis_start).count();
+                const bool publish_2d_image = shouldPublishImage(matched2d_image_pub_);
+                const bool need_2d_vis = publish_2d_image;
+                if (need_2d_vis)
+                {
+                    const std::string prev_label = show_match_labels_
+                                                       ? "Prev Frame #" + std::to_string(frame_idx_ - 1)
+                                                       : "";
+                    const std::string cur_label = show_match_labels_
+                                                      ? "Current Frame #" + std::to_string(frame_idx_)
+                                                      : "";
+                    cv::Mat vis2d = buildMatchesStackedVisualization(prev_img_, intensity_enh, prev_kp_, keypoints,
+                                                                     matches_2d_inliers, prev_label, cur_label);
+                    if (publish_2d_image)
+                    {
+                        publishMatched2DImage(vis2d, msg->header);
+                        ROS_INFO("Published 2D visualization image: %s (inliers=%zu)",
+                                 matched_2d_image_topic_.c_str(), matches_2d_inliers.size());
+                    }
+
+                }
             }
 
-            auto t_prepare3d_start = std::chrono::high_resolution_clock::now();
             std::vector<cv::Point3f> P_all, Q_all;
             std::vector<cv::DMatch> matches_for_3d;
             std::vector<double> P_intensity_all, Q_intensity_all;
@@ -2840,30 +2485,18 @@ private:
                     }
                 }
             }
-            auto t_prepare3d_end = std::chrono::high_resolution_clock::now();
-            t_match_prepare3d_ms = std::chrono::duration<double, std::milli>(t_prepare3d_end - t_prepare3d_start).count();
-
             if (P_all.size() < 3)
             {
                 ROS_WARN("Frame %d: not enough 3D correspondences after 2D filtering: %zu",
                          frame_idx_, P_all.size());
-                if (save_match_text_results_)
-                {
-                    std::ofstream ofs(outputPath("matches_3d", "matches_3d_" + std::to_string(frame_idx_) + ".txt"), std::ios::trunc);
-                    ofs.close();
-                }
             }
             else
             {
-                auto t_r3_start = std::chrono::high_resolution_clock::now();
                 std::vector<int> inlier_idx;
                 if (enable_parallel_ransac3d_ && ransac3d_threads_ > 1)
-                    inlier_idx = ransac3D_parallel(P_all, Q_all, ransac_3d_thresh_, ransac_3d_iters_, ransac3d_threads_);
+                    inlier_idx = ransac3D_parallel(Q_all, P_all, ransac_3d_thresh_, ransac_3d_iters_, ransac3d_threads_);
                 else
-                    inlier_idx = ransac3D(P_all, Q_all, ransac_3d_thresh_, ransac_3d_iters_);
-                auto t_r3_end = std::chrono::high_resolution_clock::now();
-                t_ransac3d_ms = std::chrono::duration<double, std::milli>(t_r3_end - t_r3_start).count();
-
+                    inlier_idx = ransac3D(Q_all, P_all, ransac_3d_thresh_, ransac_3d_iters_);
                 count_3d_inliers = inlier_idx.size();
 
                 std::vector<cv::DMatch> matches_3d_inliers;
@@ -2871,11 +2504,6 @@ private:
                 std::vector<double> P_intensity_in, Q_intensity_in;
                 std::vector<double> P_timestamp_in, Q_timestamp_in;
                 std::vector<std::pair<int, int>> pixel_pair_in;
-                const std::string matches3d_path = outputPath("matches_3d", "matches_3d_" + std::to_string(frame_idx_) + ".txt");
-                std::ofstream ofs3d;
-                if (save_match_text_results_)
-                    ofs3d.open(matches3d_path, std::ios::trunc);
-                auto t_collect_io_start = std::chrono::high_resolution_clock::now();
                 for (int idx_in : inlier_idx)
                 {
                     if (idx_in >= 0 && idx_in < (int)P_all.size())
@@ -2888,22 +2516,8 @@ private:
                         Q_timestamp_in.push_back(Q_timestamp_all[(size_t)idx_in]);
                         pixel_pair_in.push_back(pixel_pair_all[(size_t)idx_in]);
                         matches_3d_inliers.push_back(matches_for_3d[(size_t)idx_in]);
-                        if (ofs3d)
-                        {
-                            ofs3d << P_all[(size_t)idx_in].x << " " << P_all[(size_t)idx_in].y << " " << P_all[(size_t)idx_in].z << " "
-                                  << Q_all[(size_t)idx_in].x << " " << Q_all[(size_t)idx_in].y << " " << Q_all[(size_t)idx_in].z << "\n";
-                        }
                     }
                 }
-                if (ofs3d)
-                {
-                    ofs3d.close();
-                    ROS_INFO("Saved %zu 3D matches => %s",
-                             P_in.size(), matches3d_path.c_str());
-                }
-                auto t_collect_io_end = std::chrono::high_resolution_clock::now();
-                t_match_collect_io_ms = std::chrono::duration<double, std::milli>(t_collect_io_end - t_collect_io_start).count();
-
                 bool matched_points_published = false;
                 auto publishMatchedPairPoints =
                     [&](const std::vector<cv::Point3f> &prev_points,
@@ -2921,7 +2535,7 @@ private:
                     std_msgs::Header prev_match_header = prev_cloud_header_;
                     if (prev_match_header.frame_id.empty())
                         prev_match_header.frame_id = msg->header.frame_id;
-                    // 两个匹配点云同时发布，用当前帧 stamp 便于 RViz/echo 同步查看；点坐标本身仍是各自帧内的原始 3D 点。
+                    // Both matched clouds are published together with the current-frame stamp so RViz/echo can inspect them side by side; the point coordinates are still the original 3D points of their own frames.
                     prev_match_header.stamp = msg->header.stamp;
                     publishMatched3DPointClouds(prev_points, cur_points,
                                                 prev_intensities, cur_intensities,
@@ -2941,10 +2555,9 @@ private:
                                                   ? "Current Frame #" + std::to_string(frame_idx_)
                                                   : "";
                 const bool publish_3d_image = shouldPublishImage(matched3d_image_pub_);
-                const bool need_3d_vis = save_image_results_ || publish_3d_image;
+                const bool need_3d_vis = publish_3d_image;
                 if (need_3d_vis)
                 {
-                    auto t_3d_vis_start = std::chrono::high_resolution_clock::now();
                     cv::Mat vis3d = buildMatchesStackedVisualization(prev_img_, intensity_enh, prev_kp_, keypoints,
                                                                      matches_3d_inliers, prev_label, cur_label);
                     if (publish_3d_image)
@@ -2954,21 +2567,14 @@ private:
                                  matched_3d_image_topic_.c_str(), matches_3d_inliers.size());
                     }
 
-                    if (save_image_results_)
-                    {
-                        std::string vis3d_path = outputPath("match_3d", "match_3d_" + std::to_string(frame_idx_) + ".png");
-                        cv::imwrite(vis3d_path, vis3d);
-                        ROS_INFO("Saved 3D visualization: %s (inliers=%zu)",
-                                 vis3d_path.c_str(), matches_3d_inliers.size());
-                    }
-                    auto t_3d_vis_end = std::chrono::high_resolution_clock::now();
-                    t_match_3d_vis_ms = std::chrono::duration<double, std::milli>(t_3d_vis_end - t_3d_vis_start).count();
                 }
 
                 if (P_in.size() >= 3)
                 {
                     cv::Mat Rfit, tfit;
-                    if (estimateRigidSVD(P_in, Q_in, Rfit, tfit))
+                    // Estimate T(cur->prev) directly so the previous frame is the
+                    // fixed reference for both the joint residual and visualization.
+                    if (estimateRigidSVD(Q_in, P_in, Rfit, tfit))
                     {
                         if (enable_joint_tguess_deskew_ && cur_ts_ok)
                         {
@@ -2981,7 +2587,6 @@ private:
                             size_t joint_pairs_raw = 0;
                             size_t joint_pairs_rejected = 0;
                             double joint_pair_reject_threshold = std::numeric_limits<double>::infinity();
-                            auto t_joint_pair_start = std::chrono::high_resolution_clock::now();
                             size_t joint_pairs = 0;
                             std::string joint_pair_source;
                             if (joint_pixel_match_mode_ == "max_intensity")
@@ -3013,9 +2618,6 @@ private:
                                                         ? "joint_pixel_set_nn_filtered"
                                                         : "joint_pixel_set_nn";
                             }
-                            auto t_joint_pair_end = std::chrono::high_resolution_clock::now();
-                            t_match_joint_pair_ms = std::chrono::duration<double, std::milli>(t_joint_pair_end - t_joint_pair_start).count();
-
                             if (joint_pixel_match_mode_ == "all")
                             {
                                 const std::string joint_pair_thresh_text =
@@ -3042,8 +2644,9 @@ private:
                                 double joint_rmse_before = 0.0, joint_rmse_after = 0.0;
                                 size_t joint_used = 0;
                                 int joint_iterations = 0;
-                                double joint_time_ms = 0.0;
                                 bool joint_solution_usable = false;
+                                const cv::Mat Rfit_before_joint = Rfit.clone();
+                                const cv::Mat tfit_before_joint = tfit.clone();
                                 refineTguessWithJointDeskew(P_joint, Q_joint,
                                                             P_intensity_joint, Q_intensity_joint,
                                                             Q_timestamp_joint,
@@ -3052,24 +2655,26 @@ private:
                                                             Rfit, tfit,
                                                             joint_rmse_before, joint_rmse_after,
                                                             joint_used, joint_iterations,
-                                                            joint_time_ms, joint_solution_usable);
-                                t_match_joint_opt_ms = joint_time_ms;
+                                                            joint_solution_usable);
+
+                                const bool joint_rmse_comparable =
+                                    std::isfinite(joint_rmse_before) && std::isfinite(joint_rmse_after);
+                                const bool accept_joint_solution =
+                                    joint_solution_usable &&
+                                    (!joint_rmse_comparable || joint_rmse_after <= joint_rmse_before);
+                                if (!accept_joint_solution)
+                                {
+                                    Rfit = Rfit_before_joint.clone();
+                                    tfit = tfit_before_joint.clone();
+                                    ROS_WARN("Joint Tguess-deskew rejected: usable=%d rmse=%.4f->%.4f; fallback to SVD Tguess",
+                                             joint_solution_usable ? 1 : 0,
+                                             joint_rmse_before, joint_rmse_after);
+                                }
 
                                 const double stable_rmse_after =
                                     computeJointTguessDeskewRmse(P_in, Q_in, Q_timestamp_in,
                                                                  cur_ts_min, cur_ts_span,
                                                                  deskew_time_alpha, Rfit, tfit);
-
-                                {
-                                    std::ofstream joint_log(outputPath("logs", "joint_tguess_deskew_log.csv"), std::ios::app);
-                                    joint_log << frame_idx_ << "," << joint_used << ","
-                                              << std::fixed << std::setprecision(6)
-                                              << deskew_time_alpha << "," << stable_rmse_before << "," << stable_rmse_after << ","
-                                              << joint_iterations << ","
-                                              << std::setprecision(3) << joint_time_ms << ","
-                                              << (joint_solution_usable ? 1 : 0) << "\n";
-                                    joint_log.close();
-                                }
 
                                 ROS_INFO("Joint Tguess-deskew stable RMSE(max-intensity points): %.4f->%.4f; objective RMSE(%s): %.4f->%.4f",
                                          stable_rmse_before, stable_rmse_after,
@@ -3085,46 +2690,36 @@ private:
                             }
                         }
 
-                        // 保存本帧的 Tguess（prev->cur），用于当前帧 deskew
+                        // Store and publish the optimized Tguess(cur->prev).
                         got_tguess = true;
                         Rfit_this = Rfit.clone();
                         tfit_this = tfit.clone();
-                        cv::Mat R_inv = Rfit.t();
-                        cv::Mat t_inv = -R_inv * tfit;
 
-                        double roll = atan2(R_inv.at<double>(2, 1), R_inv.at<double>(2, 2));
-                        double pitch = atan2(-R_inv.at<double>(2, 0),
-                                             std::sqrt(R_inv.at<double>(2, 1) * R_inv.at<double>(2, 1) + R_inv.at<double>(2, 2) * R_inv.at<double>(2, 2)));
-                        double yaw = atan2(R_inv.at<double>(1, 0), R_inv.at<double>(0, 0));
+                        double roll = atan2(Rfit.at<double>(2, 1), Rfit.at<double>(2, 2));
+                        double pitch = atan2(-Rfit.at<double>(2, 0),
+                                             std::sqrt(Rfit.at<double>(2, 1) * Rfit.at<double>(2, 1) + Rfit.at<double>(2, 2) * Rfit.at<double>(2, 2)));
+                        double yaw = atan2(Rfit.at<double>(1, 0), Rfit.at<double>(0, 0));
 
-                        double tx = t_inv.at<double>(0);
-                        double ty = t_inv.at<double>(1);
-                        double tz = t_inv.at<double>(2);
+                        double tx = tfit.at<double>(0);
+                        double ty = tfit.at<double>(1);
+                        double tz = tfit.at<double>(2);
 
-                        std::ofstream fout(outputPath("tguess", "all_Tguess.txt"), std::ios::app);
-                        fout << frame_idx_ - 1 << " "
-                             << tx << " " << ty << " " << tz << " "
-                             << (roll * 180.0 / M_PI) << " "
-                             << (pitch * 180.0 / M_PI) << " "
-                             << (yaw * 180.0 / M_PI) << "\n";
-                        fout.close();
-
-                        ROS_INFO("Tguess frame %d->%d: tx=%.3f ty=%.3f tz=%.3f roll=%.2f pitch=%.2f yaw=%.2f deg",
-                                 frame_idx_ - 1, frame_idx_, tx, ty, tz,
+                        ROS_INFO("Tguess frame %d->%d (cur->prev): tx=%.3f ty=%.3f tz=%.3f roll=%.2f pitch=%.2f yaw=%.2f deg",
+                                 frame_idx_, frame_idx_ - 1, tx, ty, tz,
                                  roll * 180.0 / M_PI, pitch * 180.0 / M_PI, yaw * 180.0 / M_PI);
                         // if (tguess_pub_.getNumSubscribers() > 0)
                         {
                             nav_msgs::Odometry odom;
-                            odom.header.stamp = msg->header.stamp; // ★ 和当前帧点云同一个 stamp
-                            odom.header.frame_id = "tguess_odom";  // 父坐标系名字，自定义
-                            odom.child_frame_id = "tguess_lidar";  // 子坐标系名字，自定义
+                            odom.header.stamp = msg->header.stamp; // same stamp as the current-frame cloud
+                            odom.header.frame_id = "tguess_odom";  // parent frame name, user-defined
+                            odom.child_frame_id = "tguess_lidar";  // child frame name, user-defined
 
-                            // 位置
+                            // position
                             odom.pose.pose.position.x = tx;
                             odom.pose.pose.position.y = ty;
                             odom.pose.pose.position.z = tz;
 
-                            // 姿态（roll/pitch/yaw 是弧度）
+                            // orientation (roll/pitch/yaw are in radians)
                             tf::Quaternion q;
                             q.setRPY(roll, pitch, yaw);
                             odom.pose.pose.orientation.x = q.x();
@@ -3137,7 +2732,7 @@ private:
                                     ? static_cast<double>(count_3d_inliers) / static_cast<double>(count_2d_inliers)
                                     : 0.0;
 
-                            // covariance[0]/[1] 复用为 RANSAC 统计信息，其他项仍保留先验协方差
+                            // covariance[0]/[1] are reused for RANSAC statistics; the other entries keep the prior covariance
                             for (int i = 0; i < 36; ++i)
                                 odom.pose.covariance[i] = 0.0;
                             odom.pose.covariance[0] = ransac3d_ratio_vs_2d;
@@ -3147,7 +2742,6 @@ private:
                             odom.pose.covariance[21] = 0.05; // roll
                             odom.pose.covariance[28] = 0.05; // pitch
                             odom.pose.covariance[35] = 0.05; // yaw
-                            std::cout << "frame-Tguess_time:" << frame_idx_ << "-" << odom.header.stamp << std::endl;
                             tguess_pub_.publish(odom);
                         }
                     }
@@ -3166,50 +2760,63 @@ private:
                 }
             }
 
-            auto t_match_end = std::chrono::high_resolution_clock::now();
-            t_match_ms = std::chrono::duration<double, std::milli>(t_match_end - t_match_start).count();
-            ROS_INFO("[Frame %d] Match breakdown (ms): bf=%.3f orb_vis=%.3f r2d=%.3f vis2d=%.3f prep3d=%.3f r3d=%.3f collect_io=%.3f vis3d=%.3f joint_pair=%.3f joint_opt=%.3f total=%.3f",
-                     frame_idx_,
-                     t_match_bf_ms, t_match_orb_vis_ms,
-                     t_ransac2d_ms, t_match_2d_vis_ms,
-                     t_match_prepare3d_ms, t_ransac3d_ms,
-                     t_match_collect_io_ms, t_match_3d_vis_ms,
-                     t_match_joint_pair_ms, t_match_joint_opt_ms,
-                     t_match_ms);
         }
-        // ---------- 4.5) 用本帧 Tguess 对当前帧点云做 deskew（预测式），再对 deskew 后点云做线束采样 ----------
-        sensor_msgs::PointCloud2 cloud_for_sampling = *cloud_in; // 默认：已过滤当前帧
+        // ---------- 4.5) Use the optimized T(cur->prev) to deskew the current scan ----------
+        sensor_msgs::PointCloud2 cloud_for_sampling = *cloud_in; // default: filtered current frame
         sensor_msgs::PointCloud2 deskewed_cloud;
+        cv::Mat corrected_cache_img, corrected_cache_desc;
+        std::vector<cv::KeyPoint> corrected_cache_kp;
+        std::vector<float> corrected_cache_px, corrected_cache_py, corrected_cache_pz, corrected_cache_pint;
+        std::vector<double> corrected_cache_pts;
+        std::vector<std::vector<PixelPoint>> corrected_cache_pixel_points;
+        std::vector<char> corrected_cache_has;
+        bool corrected_cache_ready = false;
         if (got_tguess && enable_deskew_current_)
         {
-            // 注意：这里用的是 estimateRigidSVD 得到的 prev->cur (Rfit_this,tfit_this)
-            // deskew 使用每点 timestamp 得到 s，再用匀速模型把点补偿回 scan start
+            // Rfit_this/tfit_this are T(cur->prev). Deskew needs the inverse
+            // T(prev->cur), which describes the scan-internal forward motion.
             //
-            // 重要：Tguess 的时间跨度通常是“跨帧”（例如 10Hz => ~100ms），而一帧 scan 内点的时间跨度 ts_span 可能更短（例如 ~52ms）
-            // 匀速模型下应按时间比例缩放运动：alpha = ts_span / dt_guess
-            cv::Mat R_use = Rfit_this, t_use = tfit_this;
+            // Note: the Tguess time span is usually inter-frame (e.g. 10 Hz => ~100 ms), while the timestamp span inside a single scan can be shorter (e.g. ~52 ms).
+            // Under a constant-velocity model the motion is scaled by the time ratio: alpha = ts_span / dt_guess
+            cv::Mat R_use, t_use;
+            invertRigidTransform(Rfit_this, tfit_this, R_use, t_use);
             if (deskew_scale_by_time_ && deskew_time_alpha_valid)
             {
-                const double dt_guess = cur_ts_mid - prev_scan_mid_ts_; // 与 timestamp 同单位（秒或纳秒都可）
-                scaleTransformByTime(Rfit_this, tfit_this, deskew_time_alpha, R_use, t_use);
-                ROS_INFO("[Frame %d] deskew time scaling: scan_span=%.6f dt_guess=%.6f alpha=%.3f",
-                         frame_idx_, cur_ts_span, dt_guess, deskew_time_alpha);
+                cv::Mat R_scaled, t_scaled;
+                scaleTransformByTime(R_use, t_use, deskew_time_alpha, R_scaled, t_scaled);
+                R_use = R_scaled;
+                t_use = t_scaled;
             }
-            deskewPointCloudInPlaceTimestamp(cloud_for_sampling, R_use, t_use, t_deskew_ms);
-            deskewed_cloud = cloud_for_sampling;
+            const bool deskew_applied =
+                deskewPointCloudInPlaceTimestamp(cloud_for_sampling, R_use, t_use);
+            if (deskew_applied)
+            {
+                deskewed_cloud = cloud_for_sampling;
+                corrected_cache_ready = rebuildFeatureCacheFromDeskewedCloud(
+                    deskewed_cloud,
+                    corrected_cache_img, corrected_cache_desc, corrected_cache_kp,
+                    corrected_cache_px, corrected_cache_py, corrected_cache_pz,
+                    corrected_cache_pint, corrected_cache_pts,
+                    corrected_cache_pixel_points, corrected_cache_has);
+                if (!corrected_cache_ready)
+                    ROS_WARN("[Frame %d] deskew succeeded but corrected feature-cache rebuild failed; using raw cache for the next frame.",
+                             frame_idx_);
+            }
         }
 
-        const bool publish_sampled_cloud = sampled_pub_.getNumSubscribers() > 0;
-        const bool publish_raw_cloud = cloudraw_pub_.getNumSubscribers() > 0;
-        const bool publish_deskewed_cloud = deskewedcloud_pub_.getNumSubscribers() > 0;
+        const bool publish_sampled_cloud =
+            latch_published_topics_ || sampled_pub_.getNumSubscribers() > 0;
+        const bool publish_raw_cloud =
+            latch_published_topics_ || cloudraw_pub_.getNumSubscribers() > 0;
+        const bool publish_deskewed_cloud =
+            latch_published_topics_ || deskewedcloud_pub_.getNumSubscribers() > 0;
 
         if (enable_line_sampling_ && publish_sampled_cloud)
         {
-            if (samplePointCloudByRing(cloud_for_sampling, sampled_cloud, t_sample_ms))
+            if (samplePointCloudByRing(cloud_for_sampling, sampled_cloud))
             {
                 sampled_cloud.header = msg->header;
                 sampled_pub_.publish(sampled_cloud);
-                std::cout << "frame-cloud_time:" << frame_idx_ << "-" << sampled_cloud.header.stamp << std::endl;
             }
         }
 
@@ -3224,54 +2831,51 @@ private:
             deskewedcloud_pub_.publish(cloud_to_publish);
         }
 
-        // 更新上一帧时间参考（用于下一帧的 dt_guess）
+        // Update the previous-frame time reference (used for dt_guess of the next frame)
         if (cur_ts_ok)
         {
-            prev_scan_mid_ts_ = cur_ts_mid;
-            prev_scan_mid_valid_ = true;
+            prev_scan_start_ts_ = cur_ts_min;
+            prev_scan_start_valid_ = true;
         }
 
-        // ---------- 5) time_log ----------
-        auto t_total_end = std::chrono::high_resolution_clock::now();
-        double t_total_ms = std::chrono::duration<double, std::milli>(t_total_end - t_total_start).count();
+        ROS_INFO("[Frame %d] matches: ORB=%zu 2D_inliers=%zu 3D_inliers=%zu",
+                 frame_idx_, count_orb_matches, count_2d_inliers, count_3d_inliers);
 
+        // ---------- 6) Update the next-frame reference cache ----------
+        // Once a valid deskew is available, the following frame must match
+        // against this corrected intensity image and corrected 3D bindings.
+        if (corrected_cache_ready)
         {
-            std::ofstream tlog(outputPath("logs", "time_log.csv"), std::ios::app);
-            tlog << frame_idx_ << "," << std::fixed << std::setprecision(3)
-                 << t_sample_ms << "," << t_proj_ms << "," << t_enh_ms << "," << t_orb_ms << ","
-                 << t_match_ms << "," << t_ransac2d_ms << "," << t_ransac3d_ms << "," << t_total_ms << "\n";
-            tlog.close();
+            prev_img_ = corrected_cache_img.clone();
+            prev_desc_ = corrected_cache_desc.clone();
+            prev_kp_ = corrected_cache_kp;
+            prev_px_ = corrected_cache_px;
+            prev_py_ = corrected_cache_py;
+            prev_pz_ = corrected_cache_pz;
+            prev_pint_ = corrected_cache_pint;
+            prev_pts_ = corrected_cache_pts;
+            prev_pixel_points_ = corrected_cache_pixel_points;
+            prev_has_ = corrected_cache_has;
+            ROS_INFO("[Frame %d] next-frame reference uses corrected deskewed cache.", frame_idx_);
         }
-
-        ROS_INFO("[Frame %d] times(ms): sample=%.1f proj=%.1f enh=%.1f orb=%.1f match=%.1f r2d=%.1f r3d=%.1f total=%.1f",
-                 frame_idx_, t_sample_ms, t_proj_ms, t_enh_ms, t_orb_ms,
-                 t_match_ms, t_ransac2d_ms, t_ransac3d_ms, t_total_ms);
-        ROS_INFO("[Frame %d] matches: 2D_inliers=%zu 3D_inliers=%zu",
-                 frame_idx_, (size_t)count_2d_inliers, (size_t)count_3d_inliers);
-
-        // ---------- 6) 更新上一帧缓存 ----------
-        prev_img_ = intensity_enh.clone();
-        prev_desc_ = descriptors.clone();
-        prev_kp_ = keypoints;
-        prev_px_ = pixel_x;
-        prev_py_ = pixel_y;
-        prev_pz_ = pixel_z;
-        prev_pint_ = pixel_intensity;
-        prev_pts_ = pixel_timestamp;
-        prev_pixel_points_ = pixel_points;
-        prev_has_ = has_point;
+        else
+        {
+            prev_img_ = intensity_enh.clone();
+            prev_desc_ = descriptors.clone();
+            prev_kp_ = keypoints;
+            prev_px_ = pixel_x;
+            prev_py_ = pixel_y;
+            prev_pz_ = pixel_z;
+            prev_pint_ = pixel_intensity;
+            prev_pts_ = pixel_timestamp;
+            prev_pixel_points_ = pixel_points;
+            prev_has_ = has_point;
+            ROS_INFO("[Frame %d] next-frame reference uses raw cache (no accepted deskew).", frame_idx_);
+        }
         prev_cloud_header_ = msg->header;
         has_prev_frame_ = true;
 
         frame_idx_++;
     }
-};
 
-int main(int argc, char **argv)
-{
-    ros::init(argc, argv, "lidar_intensity_orb_match_dual_sampling_pubonly");
-    ros::NodeHandle nh("~");
-    LidarIntensityORBMatchDual node(nh);
-    ros::spin();
-    return 0;
-}
+}  // namespace intensity_image_enhance

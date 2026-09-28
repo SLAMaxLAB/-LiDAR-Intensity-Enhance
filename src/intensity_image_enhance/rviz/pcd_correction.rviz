@@ -7,7 +7,7 @@ Panels:
         - /Global Options1
         - /Deskewed Cloud1
       Splitter Ratio: 0.5
-    Tree Height: 1087
+    Tree Height: 270
   - Class: rviz/Selection
     Name: Selection
   - Class: rviz/Tool Properties
@@ -279,7 +279,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/XYOrbit
-      Distance: 11.098381996154785
+      Distance: 9.625937461853027
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -287,17 +287,17 @@ Visualization Manager:
         Value: false
       Field of View: 0.7853981852531433
       Focal Point:
-        X: 5.467538356781006
-        Y: 0.44028353691101074
-        Z: 0
+        X: 5.162262439727783
+        Y: 1.8063499927520752
+        Z: 1.6689300537109375e-06
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.29479753971099854
+      Pitch: 0.14979761838912964
       Target Frame: <Fixed Frame>
-      Yaw: 3.205406904220581
+      Yaw: 3.225407361984253
     Saved: ~
 Window Geometry:
   Displays:

@@ -3,38 +3,46 @@
   <name>intensity_image_enhance</name>
   <version>0.1.0</version>
   <description>
-    用于处理 PCD 点云文件的 ROS 包，提供点云强度校正功能，
-    并发布原始点云和校正后点云到 ROS 话题。
+    Intensity-assisted LiDAR odometry front end for semi-solid LiDARs with a
+    limited horizontal field of view. Projects a LiDAR cloud into a 2D
+    intensity image, estimates the inter-frame transform T(cur -> prev) from
+    ORB features and 3D correspondences, and optionally deskews the current
+    scan.
   </description>
-  
-  <maintainer email="your.email@example.com">Your Name</maintainer>
+
+  <maintainer email="just_like_wind1@163.com">Yu Li</maintainer>
   <license>BSD</license>
-  
-  <!-- 构建工具 -->
+
+  <url type="website">https://gitee.com/SLAMaxLAB/intensity_image_enhance</url>
+
   <buildtool_depend>catkin</buildtool_depend>
-  
-  <!-- 构建依赖 -->
+
   <build_depend>roscpp</build_depend>
   <build_depend>sensor_msgs</build_depend>
+  <build_depend>nav_msgs</build_depend>
   <build_depend>pcl_ros</build_depend>
   <build_depend>pcl_conversions</build_depend>
-  
-  <!-- 运行时依赖 -->
+  <build_depend>libopencv-dev</build_depend>
+  <build_depend>libceres-dev</build_depend>
+
+  <build_export_depend>roscpp</build_export_depend>
+  <build_export_depend>sensor_msgs</build_export_depend>
+  <build_export_depend>nav_msgs</build_export_depend>
+  <build_export_depend>pcl_ros</build_export_depend>
+  <build_export_depend>pcl_conversions</build_export_depend>
+  <build_export_depend>libopencv-dev</build_export_depend>
+  <build_export_depend>libceres-dev</build_export_depend>
+
   <exec_depend>roscpp</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
   <exec_depend>pcl_ros</exec_depend>
   <exec_depend>pcl_conversions</exec_depend>
+  <exec_depend>libopencv-dev</exec_depend>
+  <exec_depend>libceres-dev</exec_depend>
   <exec_depend>rviz</exec_depend>
-  
-  <!-- PCL 依赖 -->
-  <depend>libpcl-all-dev</depend>
-  
-  <!-- 导出项 -->
+
   <export>
-    <!-- 告诉 ROS 这是库包 -->
     <build_type>catkin</build_type>
-    
-    <!-- RVIZ 插件依赖（如果有的话） -->
-    <!-- <rviz plugin="${prefix}/plugin_description.xml"/> -->
   </export>
 </package>

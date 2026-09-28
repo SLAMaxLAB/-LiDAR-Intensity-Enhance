@@ -4,10 +4,7 @@ sampled_cloud_topic: "/sampled_points"
 Tguess_topic: "/Tguess"
 
 # Output
-output_dir: "/home/lb/Piont_cloudToImage/lidar_output"
-save_image_results: true
-save_pcd_results: true
-save_match_text_results: true
+# The node publishes everything over ROS topics and never writes files to disk.
 show_match_labels: true
 publish_match_images: true
 publish_raw_intensity_image: true
@@ -81,8 +78,6 @@ bilateral_d: 5
 bilateral_sigma_color: 30.0
 bilateral_sigma_space: 5.0
 contrast_mode: "clahe"
-orb_vis_radius: 2
-orb_vis_thickness: 0.5
 match_vis_radius: 2
 match_vis_thickness: 0.5
 
@@ -100,7 +95,7 @@ orb_score_type: 1
 # Parallelism
 enable_ransac_2d: true
 enable_multithread: true
-num_threads: 8
+num_threads: 4
 enable_parallel_projection: true
 enable_parallel_ransac3d: true
-ransac3d_threads: 8
+ransac3d_threads: 4
