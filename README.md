@@ -160,27 +160,6 @@ When the source cloud uses another topic, change `cloud_topic` in the selected Y
 
 All output topics are latched when `latch_published_topics: true`. A newly enabled RViz Display immediately receives the newest available message. Latching retains one message per topic; it does not replay an entire bag or publish continuously after playback stops.
 
-## Important Configuration Parameters
-
-| Parameter | Default | Description |
-| --- | --- | --- |
-| `projection_mode` | `ring` | `ring`: row is LiDAR ring; `angle`: row is elevation angle |
-| `v_res`, `h_res` | `128`, `500` | intensity image height and width |
-| `h_fov_deg` | `120.0` | horizontal field of view in degrees |
-| `store_all_pixel_points` | `true` | retain all 3D points belonging to each intensity pixel |
-| `contrast_mode` | `clahe` | `clahe`, `equalize`, or a mode that leaves the raw image unchanged |
-| `enable_bilateral_filter` | `true` | apply edge-preserving bilateral filtering before ORB |
-| `orb_nfeatures` | `200` | maximum number of ORB keypoints |
-| `ratio_thresh`, `hamming_thresh` | `0.90`, `90` | descriptor matching filters |
-| `ransac_2d_reproj` | `3.0` | 2D RANSAC reprojection threshold in pixels |
-| `ransac_3d_thresh` | `0.3` | 3D RANSAC inlier threshold in meters |
-| `enable_joint_tguess_deskew` | `true` | enable Ceres joint pose/deskew refinement |
-| `joint_pixel_match_mode` | `max_intensity` | `max_intensity` or `all` 3D points inside matched pixels |
-| `enable_deskew_current` | `false` | apply the accepted optimized pose to deskew the current cloud |
-| `deskew_scale_by_time` | `true` | scale inter-frame motion by scan span / frame interval |
-| `latch_published_topics` | `true` | preserve the latest output for late RViz subscribers |
-
-Restart the node after changing a YAML parameter. Be careful not to edit a YAML copy outside the config file passed through `config_file`.
 
 ## Output
 
