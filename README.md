@@ -107,6 +107,15 @@ Additional fields:
 
 The default input topic is `/lidar_points`. Configure it through `cloud_topic` in the YAML file. Invalid or near-origin placeholder points can be removed with `filter_origin_points` and `origin_filter_eps`.
 
+## Experiment Data
+
+The rosbag used for the experiments is available for download:
+
+- **Baidu Netdisk** (百度网盘): https://pan.baidu.com/s/1PmtT0EybBszuGbufo2-25A?pwd=ga6b
+- **Extraction code**: `ga6b`
+
+Download the bag and play it after launching the node, as shown in [Run](#run).
+
 ## Run
 
 The default configuration is [start.yaml](src/lidar_intensity_assist/config/start.yaml).
