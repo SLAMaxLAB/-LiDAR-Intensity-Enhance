@@ -111,7 +111,7 @@ The default input topic is `/lidar_points`. Configure it through `cloud_topic` i
 
 The rosbag used for the experiments is available for download:
 
-- **Baidu Netdisk** (百度网盘): https://pan.baidu.com/s/1PmtT0EybBszuGbufo2-25A?pwd=ga6b
+- **Baidu Netdisk** (百度网盘): [https://pan.baidu.com/s/1PmtT0EybBszuGbufo2-25A?pwd=ga6b](https://pan.baidu.com/s/1vRWdbCgm_gTnThlY1BRntw?pwd=hit9)
 - **Extraction code**: `ga6b`
 
 Download the bag and play it after launching the node, as shown in [Run](#run).
