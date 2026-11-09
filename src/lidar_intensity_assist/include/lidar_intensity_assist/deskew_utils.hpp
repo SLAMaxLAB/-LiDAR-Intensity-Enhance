@@ -1,7 +1,8 @@
 #pragma once
 
 #include <ceres/rotation.h>
-#include <sensor_msgs/PointCloud2.h>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/msg/point_field.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -102,7 +103,7 @@ struct CloudFields
     int x = -1, y = -1, z = -1, timestamp = -1;
 };
 
-inline bool findCloudFields(const sensor_msgs::PointCloud2 &cloud, CloudFields &fields)
+inline bool findCloudFields(const sensor_msgs::msg::PointCloud2 &cloud, CloudFields &fields)
 {
     fields = CloudFields();
     if (cloud.is_bigendian || cloud.width == 0 || cloud.height == 0 || cloud.point_step == 0)
@@ -110,18 +111,18 @@ inline bool findCloudFields(const sensor_msgs::PointCloud2 &cloud, CloudFields &
     for (const auto &field : cloud.fields)
     {
         int *offset = nullptr;
-        uint8_t expected = sensor_msgs::PointField::FLOAT32;
+        uint8_t expected = sensor_msgs::msg::PointField::FLOAT32;
         if (field.name == "x") offset = &fields.x;
         else if (field.name == "y") offset = &fields.y;
         else if (field.name == "z") offset = &fields.z;
         else if (field.name == "timestamp")
         {
             offset = &fields.timestamp;
-            expected = sensor_msgs::PointField::FLOAT64;
+            expected = sensor_msgs::msg::PointField::FLOAT64;
         }
         if (offset)
         {
-            const size_t bytes = expected == sensor_msgs::PointField::FLOAT64 ? 8 : 4;
+            const size_t bytes = expected == sensor_msgs::msg::PointField::FLOAT64 ? 8 : 4;
             if (field.datatype != expected || field.count != 1 ||
                 static_cast<size_t>(field.offset) + bytes > cloud.point_step)
                 return false;
@@ -134,7 +135,7 @@ inline bool findCloudFields(const sensor_msgs::PointCloud2 &cloud, CloudFields &
            cloud.row_step >= row_bytes && required <= cloud.data.size();
 }
 
-inline size_t pointOffset(const sensor_msgs::PointCloud2 &cloud, size_t index)
+inline size_t pointOffset(const sensor_msgs::msg::PointCloud2 &cloud, size_t index)
 {
     return (index / cloud.width) * cloud.row_step + (index % cloud.width) * cloud.point_step;
 }
@@ -164,7 +165,7 @@ struct TimestampStats
     size_t valid_points = 0;
 };
 
-inline bool timestampStats(const sensor_msgs::PointCloud2 &cloud, double min_range,
+inline bool timestampStats(const sensor_msgs::msg::PointCloud2 &cloud, double min_range,
                            double placeholder_eps, TimestampStats &stats)
 {
     stats = TimestampStats();
@@ -186,7 +187,7 @@ inline bool timestampStats(const sensor_msgs::PointCloud2 &cloud, double min_ran
 
 // omega/translation describe the total scan-end pose in the scan-start frame.
 // ring, timestamps, point order, padding and headers are preserved.
-inline bool cloudToStart(sensor_msgs::PointCloud2 &cloud, const double *omega,
+inline bool cloudToStart(sensor_msgs::msg::PointCloud2 &cloud, const double *omega,
                          const double *translation, double min_range,
                          double placeholder_eps, size_t &invalid_points)
 {

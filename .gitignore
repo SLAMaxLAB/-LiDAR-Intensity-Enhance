@@ -1,0 +1,20 @@
+# ROS 2 / colcon build artifacts
+build/
+install/
+log/
+logs/
+
+# Python and editor caches
+__pycache__/
+*.py[cod]
+.vscode/
+
+# Large runtime recordings
+*.bag
+*.db3
+*.mcap
+*.pcd
+
+# Local documentation and experiment reports
+doc/
+docs/

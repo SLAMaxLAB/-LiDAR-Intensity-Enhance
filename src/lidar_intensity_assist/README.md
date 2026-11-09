@@ -1,46 +1,38 @@
-# lidar_intensity_assist
+# lidar_intensity_assist (ROS 2)
 
 Intensity-assisted LiDAR odometry front end for semi-solid LiDARs with a limited
-horizontal field of view (for example the Hesai AT128). The node projects a
-LiDAR cloud into a 2D intensity image, matches ORB features between consecutive
+horizontal field of view, such as the Hesai AT128. The node projects a LiDAR
+cloud into a 2D intensity image, matches ORB features between consecutive
 frames, estimates the inter-frame transform `T(cur -> prev)` from image features
 and 3D correspondences, and optionally deskews the current scan.
 
-See the repository root [README.md](../../README.md) for the processing pipeline,
-topic list, configuration reference, and run instructions.
+## Requirements
 
-## Layout
-
-```text
-lidar_intensity_assist/
-├── CMakeLists.txt
-├── package.xml
-├── config/
-│   └── start.yaml                     # default node parameters
-├── launch/
-│   └── start.launch                   # node + optional RViz
-├── rviz/
-│   └── start.rviz                     # example display configuration
-├── include/lidar_intensity_assist/
-│   ├── lidar_intensity_match.hpp      # node class declaration
-│   └── math_utils.hpp                 # small numeric helpers
-└── src/
-    ├── main.cpp                       # node entry point
-    └── lidar_intensity_match.cpp      # node implementation
-```
+ROS 2 Humble, Ceres, PCL, OpenCV, and OpenMP. The node expects a
+`sensor_msgs/msg/PointCloud2` input on `/lidar_points` by default. Ring projection
+needs `x`, `y`, `z`, `intensity`, and `ring` fields; timestamp deskewing also
+needs a `timestamp` field of type `float64`.
 
 ## Build
 
+Place this directory under a ROS 2 workspace's `src/`, then run from the
+workspace root:
+
 ```bash
-source /opt/ros/noetic/setup.bash
-catkin_make --pkg lidar_intensity_assist
-source devel/setup.bash
+source /opt/ros/humble/setup.bash
+colcon build --packages-select lidar_intensity_assist
+source install/setup.bash
 ```
 
 ## Run
 
 ```bash
-roslaunch lidar_intensity_assist start.launch start_rviz:=true
+ros2 launch lidar_intensity_assist start.launch.py
 ```
 
-All tunable parameters live in [config/start.yaml](config/start.yaml).
+To start without RViz or select a different input topic:
+
+```bash
+ros2 launch lidar_intensity_assist start.launch.py start_rviz:=false
+ros2 launch lidar_intensity_assist start.launch.py start_rviz:=false config_file:=/path/to/start.yaml
+```

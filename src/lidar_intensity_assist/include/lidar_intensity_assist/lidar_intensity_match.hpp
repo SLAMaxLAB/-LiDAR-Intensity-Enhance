@@ -5,11 +5,11 @@
 
 #pragma once
 
-#include <ros/ros.h>
-#include <sensor_msgs/Image.h>
-#include <sensor_msgs/PointCloud2.h>
-#include <nav_msgs/Odometry.h>
-#include <std_msgs/Header.h>
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/image.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <nav_msgs/msg/odometry.hpp>
+#include <std_msgs/msg/header.hpp>
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/features2d.hpp>
@@ -30,7 +30,7 @@ class LidarIntensityORBMatchDual
 {
 
 public:
-    LidarIntensityORBMatchDual(ros::NodeHandle &nh);
+    LidarIntensityORBMatchDual(rclcpp::Node::SharedPtr nh);
 
 private:
     void loadParameters();
@@ -59,21 +59,23 @@ private:
         PixelPoint point;
     };
 
-    ros::NodeHandle nh_;
-    ros::Subscriber sub_;
-    ros::Publisher sampled_pub_;
-    ros::Publisher tguess_pub_;
-    ros::Publisher cloudraw_pub_;
-    ros::Publisher deskewedcloud_pub_;
-    ros::Publisher raw_intensity_image_pub_;
-    ros::Publisher enhanced_intensity_image_pub_;
-    ros::Publisher matchedorb_image_pub_;
-    ros::Publisher matched2d_image_pub_;
-    ros::Publisher matched3d_image_pub_;
-    ros::Publisher matchedprev_points_pub_;
-    ros::Publisher matchedcur_points_pub_;
+    rclcpp::Node::SharedPtr nh_;
+    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr sampled_pub_;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr tguess_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cloudraw_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr deskewedcloud_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr raw_intensity_image_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr enhanced_intensity_image_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr matchedorb_image_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr matched2d_image_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr matched3d_image_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr matchedprev_points_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr matchedcur_points_pub_;
 
     std::string cloud_topic_;
+    bool cloud_reliable_;
+    bool profile_timing_;
     std::string sampled_cloud_topic_;
     std::string Tguess_topic_;
     std::string raw_intensity_image_topic_;
@@ -169,7 +171,7 @@ private:
     std::vector<double> prev_pts_;
     std::vector<std::vector<PixelPoint>> prev_pixel_points_;
     std::vector<char> prev_has_;
-    std_msgs::Header prev_cloud_header_;
+    std_msgs::msg::Header prev_cloud_header_;
 
     std::mt19937 rng_;
 
@@ -308,7 +310,7 @@ private:
                                              const std::string &prev_label,
                                              const std::string &cur_label);
 
-    bool shouldPublishImage(const ros::Publisher &publisher) const;
+    bool shouldPublishImage(const rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr &publisher) const;
 
     bool shouldPublishRawIntensityImage() const;
 
@@ -317,28 +319,28 @@ private:
     bool shouldPublishMatchedPointClouds() const;
 
     void publishVisualizationImage(const cv::Mat &image,
-                                   const std_msgs::Header &header,
-                                   ros::Publisher &publisher);
+                                   const std_msgs::msg::Header &header,
+                                   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr &publisher);
 
     void publishLabeledIntensityImage(const cv::Mat &image, const std::string &label,
-                                      const std_msgs::Header &header, ros::Publisher &publisher);
+                                      const std_msgs::msg::Header &header, rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr &publisher);
 
     void publishRawIntensityImage(const cv::Mat &image, const std::string &label,
-                                  const std_msgs::Header &header);
+                                  const std_msgs::msg::Header &header);
 
     void publishEnhancedIntensityImage(const cv::Mat &image, const std::string &label,
-                                       const std_msgs::Header &header);
+                                       const std_msgs::msg::Header &header);
 
-    void publishMatchedORBImage(const cv::Mat &image, const std_msgs::Header &header);
+    void publishMatchedORBImage(const cv::Mat &image, const std_msgs::msg::Header &header);
 
-    void publishMatched2DImage(const cv::Mat &image, const std_msgs::Header &header);
+    void publishMatched2DImage(const cv::Mat &image, const std_msgs::msg::Header &header);
 
-    void publishMatched3DImage(const cv::Mat &image, const std_msgs::Header &header);
+    void publishMatched3DImage(const cv::Mat &image, const std_msgs::msg::Header &header);
 
-    sensor_msgs::PointCloud2 buildMatchedPointsCloud(const std::vector<cv::Point3f> &points,
+    sensor_msgs::msg::PointCloud2 buildMatchedPointsCloud(const std::vector<cv::Point3f> &points,
                                                      const std::vector<double> &intensities,
                                                      const std::vector<double> &timestamps,
-                                                     const std_msgs::Header &header) const;
+                                                     const std_msgs::msg::Header &header) const;
 
     void publishMatched3DPointClouds(const std::vector<cv::Point3f> &prev_points,
                                      const std::vector<cv::Point3f> &cur_points,
@@ -346,21 +348,21 @@ private:
                                      const std::vector<double> &cur_intensities,
                                      const std::vector<double> &prev_timestamps,
                                      const std::vector<double> &cur_timestamps,
-                                     const std_msgs::Header &prev_header,
-                                     const std_msgs::Header &cur_header);
+                                     const std_msgs::msg::Header &prev_header,
+                                     const std_msgs::msg::Header &cur_header);
 
-    bool filterOriginPoints(const sensor_msgs::PointCloud2 &in,
-                            sensor_msgs::PointCloud2 &out,
+    bool filterOriginPoints(const sensor_msgs::msg::PointCloud2 &in,
+                            sensor_msgs::msg::PointCloud2 &out,
                             size_t &removed_points) const;
 
     // ---------- Beam sampling: select a subset of rings and emit a new cloud (publish only) ----------
-    bool samplePointCloudByRing(const sensor_msgs::PointCloud2 &in,
-                                sensor_msgs::PointCloud2 &out);
+    bool samplePointCloudByRing(const sensor_msgs::msg::PointCloud2 &in,
+                                sensor_msgs::msg::PointCloud2 &out);
 
     // ---------- Timestamp statistics (used for deskew time scaling) ----------
     // Collects ts_min/ts_max from the per-point "timestamp" (float64) field of a PointCloud2, plus mid/span.
     // The same filtering rules as the deskew path apply: skip NaN, (0,0,0) placeholders, and near-origin points.
-    bool computeCloudTimestampStats(const sensor_msgs::PointCloud2 &cloud,
+    bool computeCloudTimestampStats(const sensor_msgs::msg::PointCloud2 &cloud,
                                     double &ts_min, double &ts_max,
                                     double &ts_mid, double &ts_span) const;
 
@@ -377,13 +379,13 @@ private:
     //  - every point is interpolated by s = (ts - ts_min) / (ts_max - ts_min) and compensated back to the scan start
     //
     // Deskewing rewrites x/y/z in place inside cloud.data; all other fields are left untouched.
-    bool deskewPointCloudInPlaceTimestamp(sensor_msgs::PointCloud2 &cloud,
+    bool deskewPointCloudInPlaceTimestamp(sensor_msgs::msg::PointCloud2 &cloud,
                                           const cv::Mat &R_end_in,
                                           const cv::Mat &t_end_in);
 
     // ---------- Projection mode 1: angle (az + el) ----------
     void buildIntensityImageAngle(
-        const sensor_msgs::PointCloud2 &cloud,
+        const sensor_msgs::msg::PointCloud2 &cloud,
         cv::Mat &intensity_f,
         std::vector<float> &pixel_x,
         std::vector<float> &pixel_y,
@@ -395,7 +397,7 @@ private:
 
     // ---------- Projection mode 2: ring + azimuth ----------
     void buildIntensityImageRing(
-        const sensor_msgs::PointCloud2 &cloud,
+        const sensor_msgs::msg::PointCloud2 &cloud,
         cv::Mat &intensity_f,
         std::vector<float> &pixel_x,
         std::vector<float> &pixel_y,
@@ -406,7 +408,7 @@ private:
         std::vector<char> &has_point);
 
     bool rebuildFeatureCacheFromDeskewedCloud(
-        const sensor_msgs::PointCloud2 &cloud,
+        const sensor_msgs::msg::PointCloud2 &cloud,
         cv::Mat &image_out,
         cv::Mat &descriptors_out,
         std::vector<cv::KeyPoint> &keypoints_out,
@@ -419,7 +421,7 @@ private:
         std::vector<char> &has_point_out);
 
     // ---------- Callback ----------
-    void callback(const sensor_msgs::PointCloud2ConstPtr &msg);
+    void callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg);
 
 };
 

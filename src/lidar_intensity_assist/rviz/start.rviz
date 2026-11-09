@@ -1,5 +1,5 @@
 Panels:
-  - Class: rviz/Displays
+  - Class: rviz_common/Displays
     Help Height: 138
     Name: Displays
     Property Tree Widget:
@@ -8,20 +8,20 @@ Panels:
         - /Deskewed Cloud1
       Splitter Ratio: 0.5
     Tree Height: 270
-  - Class: rviz/Selection
+  - Class: rviz_common/Selection
     Name: Selection
-  - Class: rviz/Tool Properties
+  - Class: rviz_common/Tool Properties
     Expanded:
       - /2D Pose Estimate1
       - /2D Nav Goal1
       - /Publish Point1
     Name: Tool Properties
     Splitter Ratio: 0.5886790156364441
-  - Class: rviz/Time
+  - Class: rviz_common/Time
     Name: Time
     SyncMode: 0
     SyncSource: Raw Cloud
-  - Class: rviz/Views
+  - Class: rviz_common/Views
     Expanded:
       - /Current View1
     Name: Views
@@ -35,7 +35,7 @@ Visualization Manager:
   Displays:
     - Alpha: 0.5
       Cell Size: 1
-      Class: rviz/Grid
+      Class: rviz_default_plugins/Grid
       Color: 160; 160; 164
       Enabled: false
       Line Style:
@@ -59,7 +59,7 @@ Visualization Manager:
         Value: true
       Axis: Z
       Channel Name: intensity
-      Class: rviz/PointCloud2
+      Class: rviz_default_plugins/PointCloud2
       Color: 255; 80; 80
       Color Transformer: Intensity
       Decay Time: 0
@@ -74,7 +74,12 @@ Visualization Manager:
       Size (Pixels): 2
       Size (m): 0.029999999329447746
       Style: Points
-      Topic: /pcd_correction_node/raw_cloud
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /raw_cloud
       Unreliable: false
       Use Fixed Frame: false
       Use rainbow: true
@@ -87,7 +92,7 @@ Visualization Manager:
         Value: true
       Axis: Z
       Channel Name: intensity
-      Class: rviz/PointCloud2
+      Class: rviz_default_plugins/PointCloud2
       Color: 80; 255; 80
       Color Transformer: Intensity
       Decay Time: 0
@@ -102,7 +107,12 @@ Visualization Manager:
       Size (Pixels): 4
       Size (m): 0.029999999329447746
       Style: Points
-      Topic: /sampled_points
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /sampled_points
       Unreliable: false
       Use Fixed Frame: false
       Use rainbow: true
@@ -115,7 +125,7 @@ Visualization Manager:
         Value: true
       Axis: Z
       Channel Name: intensity
-      Class: rviz/PointCloud2
+      Class: rviz_default_plugins/PointCloud2
       Color: 255; 255; 255
       Color Transformer: FlatColor
       Decay Time: 0
@@ -130,14 +140,24 @@ Visualization Manager:
       Size (Pixels): 2
       Size (m): 0.029999999329447746
       Style: Points
-      Topic: /pcd_correction_node/deskewed_cloud
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /deskewed_cloud
       Unreliable: false
       Use Fixed Frame: false
       Use rainbow: true
       Value: true
-    - Class: rviz/Image
+    - Class: rviz_default_plugins/Image
       Enabled: true
-      Image Topic: /matched_3d_image
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /matched_3d_image
       Max Value: 1
       Median window: 5
       Min Value: 0
@@ -147,9 +167,14 @@ Visualization Manager:
       Transport Hint: raw
       Unreliable: false
       Value: true
-    - Class: rviz/Image
+    - Class: rviz_default_plugins/Image
       Enabled: true
-      Image Topic: /matched_orb_image
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /matched_orb_image
       Max Value: 1
       Median window: 5
       Min Value: 0
@@ -167,7 +192,7 @@ Visualization Manager:
         Value: true
       Axis: Z
       Channel Name: intensity
-      Class: rviz/PointCloud2
+      Class: rviz_default_plugins/PointCloud2
       Color: 1; 255; 1
       Color Transformer: FlatColor
       Decay Time: 0
@@ -182,7 +207,12 @@ Visualization Manager:
       Size (Pixels): 3
       Size (m): 0.30000001192092896
       Style: Boxes
-      Topic: /matched_prev_orb_points
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /matched_prev_orb_points
       Unreliable: false
       Use Fixed Frame: true
       Use rainbow: true
@@ -195,7 +225,7 @@ Visualization Manager:
         Value: true
       Axis: Z
       Channel Name: intensity
-      Class: rviz/PointCloud2
+      Class: rviz_default_plugins/PointCloud2
       Color: 1; 255; 1
       Color Transformer: FlatColor
       Decay Time: 0
@@ -210,14 +240,24 @@ Visualization Manager:
       Size (Pixels): 3
       Size (m): 0.30000001192092896
       Style: Flat Squares
-      Topic: /matched_cur_orb_points
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /matched_cur_orb_points
       Unreliable: false
       Use Fixed Frame: true
       Use rainbow: true
       Value: true
-    - Class: rviz/Image
+    - Class: rviz_default_plugins/Image
       Enabled: false
-      Image Topic: /matched_2d_image
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /matched_2d_image
       Max Value: 1
       Median window: 5
       Min Value: 0
@@ -227,9 +267,14 @@ Visualization Manager:
       Transport Hint: raw
       Unreliable: false
       Value: false
-    - Class: rviz/Image
+    - Class: rviz_default_plugins/Image
       Enabled: true
-      Image Topic: /raw_intensity_image
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /raw_intensity_image
       Max Value: 1
       Median window: 5
       Min Value: 0
@@ -239,9 +284,14 @@ Visualization Manager:
       Transport Hint: raw
       Unreliable: false
       Value: true
-    - Class: rviz/Image
+    - Class: rviz_default_plugins/Image
       Enabled: true
-      Image Topic: /intensity_enh_image
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /intensity_enh_image
       Max Value: 1
       Median window: 5
       Min Value: 0
@@ -259,26 +309,26 @@ Visualization Manager:
     Frame Rate: 30
   Name: root
   Tools:
-    - Class: rviz/Interact
+    - Class: rviz_default_plugins/Interact
       Hide Inactive Objects: true
-    - Class: rviz/MoveCamera
-    - Class: rviz/Select
-    - Class: rviz/FocusCamera
-    - Class: rviz/Measure
-    - Class: rviz/SetInitialPose
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+    - Class: rviz_default_plugins/SetInitialPose
       Theta std deviation: 0.2617993950843811
       Topic: /initialpose
       X std deviation: 0.5
       Y std deviation: 0.5
-    - Class: rviz/SetGoal
-      Topic: /move_base_simple/goal
-    - Class: rviz/PublishPoint
+    - Class: rviz_default_plugins/SetGoal
+      Topic: /goal_pose
+    - Class: rviz_default_plugins/PublishPoint
       Single click: true
       Topic: /clicked_point
   Value: true
   Views:
     Current:
-      Class: rviz/XYOrbit
+      Class: rviz_default_plugins/Orbit
       Distance: 9.625937461853027
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
