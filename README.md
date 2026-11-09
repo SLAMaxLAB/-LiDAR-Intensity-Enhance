@@ -197,5 +197,7 @@ The joint optimizer keeps previous-frame 3D features as the reference and refine
 - Reliable deskewing requires valid per-point timestamps and sufficiently accurate inter-frame feature correspondences.
 - The first received frame initializes the feature cache and therefore does not have inter-frame matches or a pose estimate.
 - This module is a front end. It does not include loop closure, global pose-graph optimization, or map management.
+- A-LOAM Adaptation for AT128 LiDAR:** Fine-tuned the selection strategies for edge (corner) and planar (surf) features in the downstream A-LOAM algorithm to optimally accommodate the scanning characteristics of the Hesai AT128 LiDAR.
+- Confidence-Based Strategy for `T_guess`:** Implemented a confidence evaluation mechanism when feeding the module's `T_guess` to the downstream odometry. The system dynamically determines whether to accept or reject the initial pose guess for the current frame to ensure overall robustness.
 
 
