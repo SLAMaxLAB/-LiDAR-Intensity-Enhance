@@ -40,7 +40,7 @@ remap_ring_to_compact: true
 
 # Deskew
 # The optimized pose is T(cur->prev); the node internally inverts it to deskew the current scan.
-enable_deskew_current: false
+enable_deskew_current: true
 deskew_use_inverse_tguess: false
 deskew_min_range: 0.1
 deskew_placeholder_eps: 1.0e-6
