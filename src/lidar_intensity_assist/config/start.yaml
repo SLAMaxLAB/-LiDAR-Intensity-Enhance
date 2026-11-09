@@ -37,15 +37,20 @@ enable_line_sampling: true
 source_lines: 128
 target_lines: 32
 remap_ring_to_compact: true
+# Sample the accepted deskewed cloud; fall back to raw if correction is skipped.
+# Set false for an A/B comparison using the same estimator/cache pipeline.
+sample_deskewed_cloud: true
 
 # Deskew
-# The optimized pose is T(cur->prev); the node internally inverts it to deskew the current scan.
+# The optimized T(cur->prev) is interpolated with Exp(k * Log(T)) to scan start.
 enable_deskew_current: true
 deskew_use_inverse_tguess: false
 deskew_min_range: 0.1
 deskew_placeholder_eps: 1.0e-6
 sampling_filter_invalid: true
 deskew_scale_by_time: true
+# Timing validity bounds. Outside this window deskew is SKIPPED, never clamped.
+# Set min to 0.0 to allow small measured ratios after long frame intervals.
 deskew_scale_min: 0.2
 deskew_scale_max: 2.0
 

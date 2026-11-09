@@ -16,6 +16,7 @@
 
 #include <ceres/ceres.h>
 #include <ceres/rotation.h>
+#include "lidar_intensity_assist/deskew_utils.hpp"
 
 #include <limits>
 #include <random>
@@ -102,6 +103,7 @@ private:
     int source_lines_;
     int target_lines_;
     bool remap_ring_to_compact_;
+    bool sample_deskewed_cloud_;
 
     // deskew current frame by Tguess (requires per-point timestamp)
     bool enable_deskew_current_;
@@ -190,28 +192,11 @@ private:
             const T p[3] = {T(px), T(py), T(pz)};
             const T q[3] = {T(qx), T(qy), T(qz)};
 
-            // pose is T(cur->prev). Its inverse provides the prev->cur
-            // scan motion used to deskew the current-frame measurement.
-            const T neg_pose[3] = {-pose[0], -pose[1], -pose[2]};
-            const T t_cur_to_prev[3] = {pose[3], pose[4], pose[5]};
-            T rotated_translation[3];
-            ceres::AngleAxisRotatePoint(neg_pose, t_cur_to_prev, rotated_translation);
-            const T t_prev_to_cur[3] = {
-                -rotated_translation[0], -rotated_translation[1], -rotated_translation[2]};
-
-            T q_minus_t[3] = {
-                q[0] - T(s * a) * t_prev_to_cur[0],
-                q[1] - T(s * a) * t_prev_to_cur[1],
-                q[2] - T(s * a) * t_prev_to_cur[2],
-            };
-
-            T r_deskew[3] = {
-                T(s * a) * pose[0],
-                T(s * a) * pose[1],
-                T(s * a) * pose[2],
-            };
+            // Under constant body velocity, the current scan's motion is
+            // Exp(s * alpha * Log(T(cur->prev))). Use the same model for
+            // feature residuals and the full-cloud output.
             T q_deskew[3];
-            ceres::AngleAxisRotatePoint(r_deskew, q_minus_t, q_deskew);
+            deskew::transformAtFraction(pose, pose + 3, s * a, q, q_deskew);
 
             T q_in_prev[3];
             ceres::AngleAxisRotatePoint(pose, q_deskew, q_in_prev);
@@ -238,18 +223,11 @@ private:
                                          const cv::Mat &R,
                                          const cv::Mat &t) const;
 
-    static void invertRigidTransform(const cv::Mat &R,
-                                     const cv::Mat &t,
-                                     cv::Mat &R_inv,
-                                     cv::Mat &t_inv);
-
     cv::Point3d mapCurrentFeatureToPreviousReference(const cv::Point3f &q,
                                                       double s,
                                                       double alpha,
                                                       const cv::Mat &R_cur_to_prev,
-                                                      const cv::Mat &t_cur_to_prev,
-                                                      const cv::Mat &R_prev_to_cur,
-                                                      const cv::Mat &t_prev_to_cur) const;
+                                                      const cv::Mat &t_cur_to_prev) const;
 
     static cv::Point3f toPoint3f(const PixelPoint &p);
 
@@ -388,14 +366,14 @@ private:
 
     // ---------- SE(3) time scaling: scale an inter-frame Tguess down to the intra-scan motion ----------
     // Under a constant-velocity assumption the motion is Twist * dt, so log(SE(3)) scales linearly with time.
-    // Approximation used here: R_scaled = Exp(alpha * log(R)), t_scaled = alpha * t
+    // Exact constant-body-velocity interpolation, including translation coupling.
     static inline void scaleTransformByTime(const cv::Mat &R_in, const cv::Mat &t_in,
                                             double alpha, cv::Mat &R_out, cv::Mat &t_out);
 
     // ---------- Point-cloud deskewing: per-point timestamp + Tguess (constant-velocity model) ----------
     // Notes:
     //  - requires the PointCloud2 fields x/y/z/timestamp (timestamp as float64)
-    //  - Tguess (R_end, t_end) approximates the start->end motion over one scan period
+    //  - (R_end, t_end) maps scan-end coordinates into scan-start coordinates
     //  - every point is interpolated by s = (ts - ts_min) / (ts_max - ts_min) and compensated back to the scan start
     //
     // Deskewing rewrites x/y/z in place inside cloud.data; all other fields are left untouched.

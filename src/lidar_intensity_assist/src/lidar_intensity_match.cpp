@@ -90,6 +90,7 @@ void LidarIntensityORBMatchDual::loadParameters()
     nh_.param<int>("source_lines", source_lines_, 128);
     nh_.param<int>("target_lines", target_lines_, 32);
     nh_.param<bool>("remap_ring_to_compact", remap_ring_to_compact_, true);
+    nh_.param<bool>("sample_deskewed_cloud", sample_deskewed_cloud_, true);
 
     // deskew & filtering (for Hesai AT128 with per-point timestamp)
     nh_.param<bool>("enable_deskew_current", enable_deskew_current_, true);
@@ -101,6 +102,13 @@ void LidarIntensityORBMatchDual::loadParameters()
     nh_.param<bool>("deskew_scale_by_time", deskew_scale_by_time_, true);
     nh_.param<double>("deskew_scale_min", deskew_scale_min_, 0.2);
     nh_.param<double>("deskew_scale_max", deskew_scale_max_, 2.0);
+    if (!std::isfinite(deskew_scale_min_) || !std::isfinite(deskew_scale_max_) ||
+        deskew_scale_min_ < 0.0 || deskew_scale_max_ <= deskew_scale_min_)
+    {
+        ROS_WARN("Invalid deskew timing bounds; using [0.2, 2.0] as a validity window.");
+        deskew_scale_min_ = 0.2;
+        deskew_scale_max_ = 2.0;
+    }
 
     nh_.param<float>("ratio_thresh", ratio_thresh_, 0.75f);
     nh_.param<int>("hamming_thresh", hamming_thresh_, 50);
@@ -257,6 +265,7 @@ void LidarIntensityORBMatchDual::logConfiguration()
     ROS_INFO("Line sampling (publish only): %s, source_lines=%d target_lines=%d remap=%s",
              enable_line_sampling_ ? "ENABLED" : "DISABLED",
              source_lines_, target_lines_, remap_ring_to_compact_ ? "true" : "false");
+    ROS_INFO("Sampling source: %s", sample_deskewed_cloud_ ? "accepted deskewed cloud (raw fallback)" : "raw cloud");
     
 }
 
@@ -266,47 +275,26 @@ cv::Point3d LidarIntensityORBMatchDual::deskewFeaturePointByPose(const cv::Point
                                          const cv::Mat &R,
                                          const cv::Mat &t) const
 {
-        cv::Mat rvec;
-        cv::Rodrigues(R, rvec);
-        rvec *= (s * alpha);
-
-        cv::Mat R_s;
-        cv::Rodrigues(rvec, R_s);
-
-        cv::Mat q_mat = (cv::Mat_<double>(3, 1) << q.x, q.y, q.z);
-        cv::Mat t_s = t * (s * alpha);
-        cv::Mat q_deskew = R_s.t() * (q_mat - t_s);
-        return cv::Point3d(q_deskew.at<double>(0),
-                           q_deskew.at<double>(1),
-                           q_deskew.at<double>(2));
-    }
-
-void LidarIntensityORBMatchDual::invertRigidTransform(const cv::Mat &R,
-                                     const cv::Mat &t,
-                                     cv::Mat &R_inv,
-                                     cv::Mat &t_inv)
-{
-        R_inv = R.t();
-        t_inv = -R_inv * t;
-    }
+    cv::Mat rvec;
+    cv::Rodrigues(R, rvec);
+    const double point[3] = {q.x, q.y, q.z};
+    double corrected[3];
+    deskew::transformAtFraction(rvec.ptr<double>(), t.ptr<double>(), s * alpha, point, corrected);
+    return cv::Point3d(corrected[0], corrected[1], corrected[2]);
+}
 
 cv::Point3d LidarIntensityORBMatchDual::mapCurrentFeatureToPreviousReference(const cv::Point3f &q,
                                                       double s,
                                                       double alpha,
                                                       const cv::Mat &R_cur_to_prev,
-                                                      const cv::Mat &t_cur_to_prev,
-                                                      const cv::Mat &R_prev_to_cur,
-                                                      const cv::Mat &t_prev_to_cur) const
+                                                      const cv::Mat &t_cur_to_prev) const
 {
-        const cv::Point3d q_deskew =
-            deskewFeaturePointByPose(q, s, alpha, R_prev_to_cur, t_prev_to_cur);
-
-        cv::Mat q_mat = (cv::Mat_<double>(3, 1) << q_deskew.x, q_deskew.y, q_deskew.z);
-        cv::Mat q_in_prev = R_cur_to_prev * q_mat + t_cur_to_prev;
-        return cv::Point3d(q_in_prev.at<double>(0),
-                           q_in_prev.at<double>(1),
-                           q_in_prev.at<double>(2));
-    }
+    const cv::Point3d q_deskew =
+        deskewFeaturePointByPose(q, s, alpha, R_cur_to_prev, t_cur_to_prev);
+    cv::Mat q_mat = (cv::Mat_<double>(3, 1) << q_deskew.x, q_deskew.y, q_deskew.z);
+    cv::Mat q_in_prev = R_cur_to_prev * q_mat + t_cur_to_prev;
+    return cv::Point3d(q_in_prev.at<double>(0), q_in_prev.at<double>(1), q_in_prev.at<double>(2));
+}
 
 cv::Point3f LidarIntensityORBMatchDual::toPoint3f(const PixelPoint &p)
 {
@@ -405,8 +393,6 @@ size_t LidarIntensityORBMatchDual::buildNearestPixelSetCorrespondences(
         };
 
         std::vector<Candidate> candidates;
-        cv::Mat R_prev_to_cur, t_prev_to_cur;
-        invertRigidTransform(R, t, R_prev_to_cur, t_prev_to_cur);
 
         for (const auto &pair : pixel_pairs)
         {
@@ -432,7 +418,7 @@ size_t LidarIntensityORBMatchDual::buildNearestPixelSetCorrespondences(
                 double s = (q_point.timestamp - cur_ts_min) / cur_ts_span;
                 s = std::max(0.0, std::min(1.0, s));
                 const cv::Point3d q_in_prev = mapCurrentFeatureToPreviousReference(
-                    toPoint3f(q_point), s, alpha, R, t, R_prev_to_cur, t_prev_to_cur);
+                    toPoint3f(q_point), s, alpha, R, t);
 
                 size_t best_prev_idx = std::numeric_limits<size_t>::max();
                 double best_dist2 = std::numeric_limits<double>::infinity();
@@ -565,8 +551,6 @@ double LidarIntensityORBMatchDual::computeJointTguessDeskewRmse(const std::vecto
 
         double sum_sq = 0.0;
         size_t used = 0;
-        cv::Mat R_prev_to_cur, t_prev_to_cur;
-        invertRigidTransform(R, t, R_prev_to_cur, t_prev_to_cur);
         for (size_t i = 0; i < P.size(); ++i)
         {
             if (!std::isfinite(Q_ts[i]))
@@ -575,7 +559,7 @@ double LidarIntensityORBMatchDual::computeJointTguessDeskewRmse(const std::vecto
             s = std::max(0.0, std::min(1.0, s));
 
             const cv::Point3d q_in_prev = mapCurrentFeatureToPreviousReference(
-                Q[i], s, alpha, R, t, R_prev_to_cur, t_prev_to_cur);
+                Q[i], s, alpha, R, t);
             const double dx = q_in_prev.x - P[i].x;
             const double dy = q_in_prev.y - P[i].y;
             const double dz = q_in_prev.z - P[i].z;
@@ -849,7 +833,10 @@ std::vector<int> LidarIntensityORBMatchDual::ransac3D_parallel(const std::vector
 #pragma omp critical
 #endif
             {
-                if (best_local.size() > best_global.size())
+                // Equal-size consensuses must not depend on thread completion
+                // order, especially when comparing raw and deskewed outputs.
+                if (best_local.size() > best_global.size() ||
+                    (best_local.size() == best_global.size() && best_local < best_global))
                     best_global.swap(best_local);
             }
         }
@@ -1352,314 +1339,53 @@ bool LidarIntensityORBMatchDual::computeCloudTimestampStats(const sensor_msgs::P
                                     double &ts_min, double &ts_max,
                                     double &ts_mid, double &ts_span) const
 {
-        ts_min = std::numeric_limits<double>::infinity();
-        ts_max = -std::numeric_limits<double>::infinity();
-        ts_mid = std::numeric_limits<double>::quiet_NaN();
-        ts_span = 0.0;
-
-        const size_t num_points = (size_t)cloud.width * cloud.height;
-        if (num_points == 0 || cloud.data.empty())
-            return false;
-
-        int offset_x = -1, offset_y = -1, offset_z = -1, offset_ts = -1;
-        int dtype_ts = -1;
-        for (const auto &f : cloud.fields)
-        {
-            if (f.name == "x")
-                offset_x = f.offset;
-            else if (f.name == "y")
-                offset_y = f.offset;
-            else if (f.name == "z")
-                offset_z = f.offset;
-            else if (f.name == "timestamp")
-            {
-                offset_ts = f.offset;
-                dtype_ts = f.datatype;
-            }
-        }
-        if (offset_x < 0 || offset_y < 0 || offset_z < 0 || offset_ts < 0)
-            return false;
-        if (dtype_ts != sensor_msgs::PointField::FLOAT64)
-            return false;
-
-        const size_t point_step = cloud.point_step;
-        if ((size_t)offset_x + sizeof(float) > point_step ||
-            (size_t)offset_y + sizeof(float) > point_step ||
-            (size_t)offset_z + sizeof(float) > point_step ||
-            (size_t)offset_ts + sizeof(double) > point_step)
-            return false;
-
-        const uint8_t *base_ptr = cloud.data.data();
-        const float min_range2 = deskew_min_range_ * deskew_min_range_;
-        const float eps_l1 = deskew_placeholder_eps_;
-
-        size_t valid = 0;
-        for (size_t idx = 0; idx < num_points; ++idx)
-        {
-            const uint8_t *p = base_ptr + idx * point_step;
-
-            float x, y, z;
-            std::memcpy(&x, p + offset_x, sizeof(float));
-            std::memcpy(&y, p + offset_y, sizeof(float));
-            std::memcpy(&z, p + offset_z, sizeof(float));
-            if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
-                continue;
-            if (std::fabs(x) + std::fabs(y) + std::fabs(z) < eps_l1)
-                continue;
-            if (x * x + y * y + z * z < min_range2)
-                continue;
-
-            double ts;
-            std::memcpy(&ts, p + offset_ts, sizeof(double));
-            if (!std::isfinite(ts))
-                continue;
-
-            ts_min = std::min(ts_min, ts);
-            ts_max = std::max(ts_max, ts);
-            ++valid;
-        }
-
-        if (valid < 50 || !(ts_max > ts_min))
-            return false;
-
-        ts_span = ts_max - ts_min;
-        ts_mid = 0.5 * (ts_min + ts_max);
-        return std::isfinite(ts_mid);
-    }
+    deskew::TimestampStats stats;
+    const bool valid = deskew::timestampStats(cloud, deskew_min_range_, deskew_placeholder_eps_, stats);
+    ts_min = stats.min;
+    ts_max = stats.max;
+    ts_span = valid ? stats.max - stats.min : 0.0;
+    ts_mid = valid ? stats.min + 0.5 * ts_span : std::numeric_limits<double>::quiet_NaN();
+    return valid;
+}
 
 void LidarIntensityORBMatchDual::scaleTransformByTime(const cv::Mat &R_in, const cv::Mat &t_in,
                                             double alpha, cv::Mat &R_out, cv::Mat &t_out)
 {
-        if (!std::isfinite(alpha))
-            alpha = 1.0;
-        if (std::fabs(alpha - 1.0) < 1e-6)
-        {
-            R_out = R_in.clone();
-            t_out = t_in.clone();
-            return;
-        }
-        cv::Mat rvec;
-        cv::Rodrigues(R_in, rvec);
-        rvec *= alpha;
-        cv::Rodrigues(rvec, R_out);
-        t_out = t_in * alpha;
-    }
+    cv::Mat rvec;
+    cv::Rodrigues(R_in, rvec);
+    const double origin[3] = {0.0, 0.0, 0.0};
+    double scaled_translation[3];
+    deskew::transformAtFraction(rvec.ptr<double>(), t_in.ptr<double>(), alpha, origin, scaled_translation);
+    cv::Mat scaled_rvec = rvec * alpha;
+    cv::Rodrigues(scaled_rvec, R_out);
+    t_out = (cv::Mat_<double>(3, 1) << scaled_translation[0], scaled_translation[1], scaled_translation[2]);
+}
 
 bool LidarIntensityORBMatchDual::deskewPointCloudInPlaceTimestamp(sensor_msgs::PointCloud2 &cloud,
                                           const cv::Mat &R_end_in,
                                           const cv::Mat &t_end_in)
 {
-        if (!enable_deskew_current_)
-            return false;
-
-        const size_t num_points = (size_t)cloud.width * cloud.height;
-        if (num_points == 0 || cloud.data.empty())
-            return false;
-
-        // Locate the field offsets (note: the AT128 point_step is not necessarily 4/8-byte aligned, so memcpy must be used)
-        int offset_x = -1, offset_y = -1, offset_z = -1, offset_ts = -1;
-        int dtype_ts = -1;
-        for (const auto &f : cloud.fields)
-        {
-            if (f.name == "x")
-                offset_x = f.offset;
-            else if (f.name == "y")
-                offset_y = f.offset;
-            else if (f.name == "z")
-                offset_z = f.offset;
-            else if (f.name == "timestamp")
-            {
-                offset_ts = f.offset;
-                dtype_ts = f.datatype;
-            }
-        }
-        if (offset_x < 0 || offset_y < 0 || offset_z < 0 || offset_ts < 0)
-        {
-            ROS_WARN_THROTTLE(1.0, "deskew disabled: missing x/y/z/timestamp field.");
-            return false;
-        }
-        if (dtype_ts != sensor_msgs::PointField::FLOAT64)
-        {
-            ROS_WARN_THROTTLE(1.0, "deskew disabled: timestamp datatype is not FLOAT64 (datatype=%d).", dtype_ts);
-            return false;
-        }
-
-        const size_t point_step = cloud.point_step;
-        if ((size_t)offset_x + sizeof(float) > point_step ||
-            (size_t)offset_y + sizeof(float) > point_step ||
-            (size_t)offset_z + sizeof(float) > point_step ||
-            (size_t)offset_ts + sizeof(double) > point_step)
-        {
-            ROS_ERROR("deskewPointCloudInPlaceTimestamp: field offsets exceed point_step (point_step=%zu).", point_step);
-            return false;
-        }
-
-        uint8_t *base_ptr = cloud.data.data();
-
-        // 1) Collect the timestamp range of the current frame (invalid points ignored)
-        double ts_min = std::numeric_limits<double>::infinity();
-        double ts_max = -std::numeric_limits<double>::infinity();
-        size_t valid_for_span = 0;
-
-        const float min_range2 = deskew_min_range_ * deskew_min_range_;
-        const float eps_l1 = deskew_placeholder_eps_;
-
-        for (size_t idx = 0; idx < num_points; ++idx)
-        {
-            const uint8_t *p = base_ptr + idx * point_step;
-
-            float x, y, z;
-            std::memcpy(&x, p + offset_x, sizeof(float));
-            std::memcpy(&y, p + offset_y, sizeof(float));
-            std::memcpy(&z, p + offset_z, sizeof(float));
-
-            if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
-                continue;
-            if (std::fabs(x) + std::fabs(y) + std::fabs(z) < eps_l1)
-                continue;
-            const float r2 = x * x + y * y + z * z;
-            if (r2 < min_range2)
-                continue;
-
-            double ts;
-            std::memcpy(&ts, p + offset_ts, sizeof(double));
-            if (!std::isfinite(ts))
-                continue;
-
-            ts_min = std::min(ts_min, ts);
-            ts_max = std::max(ts_max, ts);
-            ++valid_for_span;
-        }
-
-        if (valid_for_span < 50 || !(ts_max > ts_min))
-        {
-            ROS_WARN_THROTTLE(1.0, "deskew disabled: bad timestamp span (valid=%zu, min=%.6f max=%.6f).",
-                              valid_for_span, ts_min, ts_max);
-            return false;
-        }
-        const double ts_span = ts_max - ts_min;
-
-        // 2) Precompute the rotation axis-angle (log(R_end))
-        cv::Mat R_end = R_end_in;
-        cv::Mat t_end = t_end_in;
-        if (deskew_use_inverse_tguess_)
-        {
-            ROS_WARN_THROTTLE(1.0,
-                              "deskew_use_inverse_tguess is deprecated and ignored: deskew always receives T(prev->cur).");
-        }
-
-        cv::Mat rvec_end;
-        cv::Rodrigues(R_end, rvec_end); // 3x1 (axis * angle)
-
-        const double rx = rvec_end.at<double>(0);
-        const double ry = rvec_end.at<double>(1);
-        const double rz = rvec_end.at<double>(2);
-        const double angle_end = std::sqrt(rx * rx + ry * ry + rz * rz);
-
-        double ax = 0.0, ay = 0.0, az = 0.0;
-        if (angle_end > 1e-12)
-        {
-            ax = rx / angle_end;
-            ay = ry / angle_end;
-            az = rz / angle_end;
-        }
-
-        const double tx = t_end.at<double>(0);
-        const double ty = t_end.at<double>(1);
-        const double tz = t_end.at<double>(2);
-
-        const float nan_f = std::numeric_limits<float>::quiet_NaN();
-        size_t nan_written = 0;
-
-        // 3) Second pass: deskew every point
-        for (size_t idx = 0; idx < num_points; ++idx)
-        {
-            uint8_t *p = base_ptr + idx * point_step;
-
-            float xf, yf, zf;
-            std::memcpy(&xf, p + offset_x, sizeof(float));
-            std::memcpy(&yf, p + offset_y, sizeof(float));
-            std::memcpy(&zf, p + offset_z, sizeof(float));
-
-            if (!std::isfinite(xf) || !std::isfinite(yf) || !std::isfinite(zf) ||
-                (std::fabs(xf) + std::fabs(yf) + std::fabs(zf) < eps_l1) ||
-                (xf * xf + yf * yf + zf * zf < min_range2))
-            {
-                // Invalid/placeholder point: write NaN so deskewing does not produce "origin rays"
-                std::memcpy(p + offset_x, &nan_f, sizeof(float));
-                std::memcpy(p + offset_y, &nan_f, sizeof(float));
-                std::memcpy(p + offset_z, &nan_f, sizeof(float));
-                ++nan_written;
-                continue;
-            }
-
-            double ts;
-            std::memcpy(&ts, p + offset_ts, sizeof(double));
-            if (!std::isfinite(ts))
-            {
-                std::memcpy(p + offset_x, &nan_f, sizeof(float));
-                std::memcpy(p + offset_y, &nan_f, sizeof(float));
-                std::memcpy(p + offset_z, &nan_f, sizeof(float));
-                ++nan_written;
-                continue;
-            }
-
-            double s = (ts - ts_min) / ts_span;
-            if (s < 0.0)
-                s = 0.0;
-            if (s > 1.0)
-                s = 1.0;
-
-            // Translation interpolation: t(s) = s * t_end
-            const double tsx = s * tx;
-            const double tsy = s * ty;
-            const double tsz = s * tz;
-
-            // Rotation interpolation: R(s) = Exp(s * log(R_end)), via axis-angle -> quaternion
-            double w = 1.0, qx = 0.0, qy = 0.0, qz = 0.0;
-            if (angle_end > 1e-12)
-            {
-                const double half = 0.5 * (s * angle_end);
-                const double sh = std::sin(half);
-                w = std::cos(half);
-                qx = ax * sh;
-                qy = ay * sh;
-                qz = az * sh;
-            }
-
-            // Subtract the translation first: v = p - t(s)
-            double vx = (double)xf - tsx;
-            double vy = (double)yf - tsy;
-            double vz = (double)zf - tsz;
-
-            // Deskew back to the scan start: p_start = R(s)^T * (p - t(s))
-            // i.e. v_rot = q_conj * v * q, with q_conj = (w, -qx, -qy, -qz)
-            const double cx = -qx, cy = -qy, cz = -qz;
-
-            // t = 2 * cross(c, v)
-            const double tx2 = 2.0 * (cy * vz - cz * vy);
-            const double ty2 = 2.0 * (cz * vx - cx * vz);
-            const double tz2 = 2.0 * (cx * vy - cy * vx);
-
-            // v' = v + w*t + cross(c, t)
-            const double vpx = vx + w * tx2 + (cy * tz2 - cz * ty2);
-            const double vpy = vy + w * ty2 + (cz * tx2 - cx * tz2);
-            const double vpz = vz + w * tz2 + (cx * ty2 - cy * tx2);
-
-            float xo = (float)vpx;
-            float yo = (float)vpy;
-            float zo = (float)vpz;
-
-            std::memcpy(p + offset_x, &xo, sizeof(float));
-            std::memcpy(p + offset_y, &yo, sizeof(float));
-            std::memcpy(p + offset_z, &zo, sizeof(float));
-        }
-
-        ROS_INFO("[Frame %d] deskew(current,Tguess): points=%zu nan_written=%zu span=%.6f",
-                 frame_idx_, num_points, nan_written, ts_span);
-
-        return true;
+    if (!enable_deskew_current_)
+        return false;
+    if (R_end_in.rows != 3 || R_end_in.cols != 3 || R_end_in.type() != CV_64F ||
+        t_end_in.rows != 3 || t_end_in.cols != 1 || t_end_in.type() != CV_64F ||
+        !cv::checkRange(R_end_in) || !cv::checkRange(t_end_in))
+        return false;
+    if (deskew_use_inverse_tguess_)
+        ROS_WARN_THROTTLE(1.0, "deskew_use_inverse_tguess is deprecated and ignored.");
+    cv::Mat rvec;
+    cv::Rodrigues(R_end_in, rvec);
+    size_t invalid_points = 0;
+    if (!deskew::cloudToStart(cloud, rvec.ptr<double>(), t_end_in.ptr<double>(),
+                              deskew_min_range_, deskew_placeholder_eps_, invalid_points))
+    {
+        ROS_WARN_THROTTLE(1.0, "deskew skipped: invalid cloud layout, pose or timestamp span.");
+        return false;
     }
+    ROS_INFO("[Frame %d] deskew to scan start: points=%zu invalid=%zu",
+             frame_idx_, size_t(cloud.width) * cloud.height, invalid_points);
+    return true;
+}
 
 void LidarIntensityORBMatchDual::buildIntensityImageAngle(
         const sensor_msgs::PointCloud2 &cloud,
@@ -2196,7 +1922,7 @@ bool LidarIntensityORBMatchDual::rebuildFeatureCacheFromDeskewedCloud(
 
         ROS_INFO("[Frame %d] rebuilt corrected feature cache: orb_features=%zu",
                  frame_idx_, keypoints_out.size());
-        return true;
+        return !descriptors_out.empty();
     }
 
 void LidarIntensityORBMatchDual::callback(const sensor_msgs::PointCloud2ConstPtr &msg)
@@ -2220,26 +1946,22 @@ void LidarIntensityORBMatchDual::callback(const sensor_msgs::PointCloud2ConstPtr
         // 0) Collect the per-point timestamp range of the current frame (for deskew time scaling)
         double cur_ts_min = 0.0, cur_ts_max = 0.0, cur_ts_mid = 0.0, cur_ts_span = 0.0;
         bool cur_ts_ok = computeCloudTimestampStats(*cloud_in, cur_ts_min, cur_ts_max, cur_ts_mid, cur_ts_span);
-        double deskew_time_alpha = 1.0;
+        double deskew_time_alpha = std::numeric_limits<double>::quiet_NaN();
         bool deskew_time_alpha_valid = false;
         if (deskew_scale_by_time_ && cur_ts_ok && prev_scan_start_valid_)
         {
             const double dt_guess = cur_ts_min - prev_scan_start_ts_; // start-to-start, same unit as timestamp (seconds or nanoseconds)
-            if (std::isfinite(dt_guess) && dt_guess > 1e-12 && std::isfinite(cur_ts_span) && cur_ts_span > 0.0)
-            {
-                deskew_time_alpha = cur_ts_span / dt_guess;
-                if (!std::isfinite(deskew_time_alpha))
-                    deskew_time_alpha = 1.0;
-                if (deskew_time_alpha < deskew_scale_min_)
-                    deskew_time_alpha = deskew_scale_min_;
-                if (deskew_time_alpha > deskew_scale_max_)
-                    deskew_time_alpha = deskew_scale_max_;
-                deskew_time_alpha_valid = true;
-            }
+            deskew_time_alpha_valid = deskew::computeTimeScale(
+                cur_ts_span, dt_guess, deskew_scale_min_, deskew_scale_max_, deskew_time_alpha);
+            if (!deskew_time_alpha_valid)
+                ROS_WARN("[Frame %d] deskew skipped: scan_span=%.6f frame_interval=%.6f alpha=%.6f outside timing validity window [%.3f, %.3f].",
+                         frame_idx_, cur_ts_span, dt_guess, deskew_time_alpha,
+                         deskew_scale_min_, deskew_scale_max_);
         }
         else if (!deskew_scale_by_time_)
         {
-            deskew_time_alpha_valid = cur_ts_ok;
+            deskew_time_alpha = 1.0;
+            deskew_time_alpha_valid = cur_ts_ok && prev_scan_start_valid_ && cur_ts_min > prev_scan_start_ts_;
         }
 
         // 0) Beam sampling (publish only, not used for projection)
@@ -2247,6 +1969,7 @@ void LidarIntensityORBMatchDual::callback(const sensor_msgs::PointCloud2ConstPtr
 
         // 0.1) Current-frame Tguess (from image matching), used for the predictive constant-velocity deskew of the current frame
         bool got_tguess = false;
+        bool deskew_pose_accepted = false;
         cv::Mat Rfit_this, tfit_this; // cur->prev
 
         // ---------- 1) Projection: use the filtered current-frame cloud ----------
@@ -2580,9 +2303,11 @@ void LidarIntensityORBMatchDual::callback(const sensor_msgs::PointCloud2ConstPtr
                     cv::Mat Rfit, tfit;
                     // Estimate T(cur->prev) directly so the previous frame is the
                     // fixed reference for both the joint residual and visualization.
-                    if (estimateRigidSVD(Q_in, P_in, Rfit, tfit))
+                    if (estimateRigidSVD(Q_in, P_in, Rfit, tfit) &&
+                        cv::checkRange(Rfit) && cv::checkRange(tfit))
                     {
-                        if (enable_joint_tguess_deskew_ && cur_ts_ok)
+                        bool joint_accepted = !enable_joint_tguess_deskew_;
+                        if (enable_joint_tguess_deskew_ && deskew_time_alpha_valid)
                         {
                             const double stable_rmse_before =
                                 computeJointTguessDeskewRmse(P_in, Q_in, Q_timestamp_in,
@@ -2667,7 +2392,8 @@ void LidarIntensityORBMatchDual::callback(const sensor_msgs::PointCloud2ConstPtr
                                     std::isfinite(joint_rmse_before) && std::isfinite(joint_rmse_after);
                                 const bool accept_joint_solution =
                                     joint_solution_usable &&
-                                    (!joint_rmse_comparable || joint_rmse_after <= joint_rmse_before);
+                                    joint_rmse_comparable && joint_rmse_after <= joint_rmse_before;
+                                joint_accepted = accept_joint_solution;
                                 if (!accept_joint_solution)
                                 {
                                     Rfit = Rfit_before_joint.clone();
@@ -2694,6 +2420,22 @@ void LidarIntensityORBMatchDual::callback(const sensor_msgs::PointCloud2ConstPtr
                                          joint_pairs, std::max(3, joint_tguess_min_matches_),
                                          joint_pairs_raw, joint_pairs_rejected);
                             }
+                        }
+
+                        if (deskew_time_alpha_valid)
+                        {
+                            const size_t timed_matches = static_cast<size_t>(std::count_if(
+                                Q_timestamp_in.begin(), Q_timestamp_in.end(),
+                                [](double stamp) { return std::isfinite(stamp); }));
+                            const double pose_rmse = computeJointTguessDeskewRmse(
+                                P_in, Q_in, Q_timestamp_in, cur_ts_min, cur_ts_span,
+                                deskew_time_alpha, Rfit, tfit);
+                            deskew_pose_accepted = joint_accepted &&
+                                timed_matches >= static_cast<size_t>(std::max(6, joint_tguess_min_matches_)) &&
+                                std::isfinite(pose_rmse) && pose_rmse <= ransac_3d_thresh_;
+                            if (!deskew_pose_accepted && enable_deskew_current_)
+                                ROS_WARN("[Frame %d] deskew skipped: joint_accepted=%d matches=%zu model_rmse=%.4f (limit %.4f).",
+                                         frame_idx_, joint_accepted ? 1 : 0, P_in.size(), pose_rmse, ransac_3d_thresh_);
                         }
 
                         // Store and publish the optimized Tguess(cur->prev).
@@ -2776,22 +2518,12 @@ void LidarIntensityORBMatchDual::callback(const sensor_msgs::PointCloud2ConstPtr
         std::vector<std::vector<PixelPoint>> corrected_cache_pixel_points;
         std::vector<char> corrected_cache_has;
         bool corrected_cache_ready = false;
-        if (got_tguess && enable_deskew_current_)
+        if (got_tguess && enable_deskew_current_ && deskew_pose_accepted && deskew_time_alpha_valid)
         {
-            // Rfit_this/tfit_this are T(cur->prev). Deskew needs the inverse
-            // T(prev->cur), which describes the scan-internal forward motion.
-            //
-            // Note: the Tguess time span is usually inter-frame (e.g. 10 Hz => ~100 ms), while the timestamp span inside a single scan can be shorter (e.g. ~52 ms).
-            // Under a constant-velocity model the motion is scaled by the time ratio: alpha = ts_span / dt_guess
+            // T(cur->prev) also describes the forward sensor displacement.
+            // Exp(alpha * Log(T)) maps scan-end points into scan-start coordinates.
             cv::Mat R_use, t_use;
-            invertRigidTransform(Rfit_this, tfit_this, R_use, t_use);
-            if (deskew_scale_by_time_ && deskew_time_alpha_valid)
-            {
-                cv::Mat R_scaled, t_scaled;
-                scaleTransformByTime(R_use, t_use, deskew_time_alpha, R_scaled, t_scaled);
-                R_use = R_scaled;
-                t_use = t_scaled;
-            }
+            scaleTransformByTime(Rfit_this, tfit_this, deskew_time_alpha, R_use, t_use);
             sensor_msgs::PointCloud2 deskew_working = *cloud_in;
             const bool deskew_applied =
                 deskewPointCloudInPlaceTimestamp(deskew_working, R_use, t_use);
@@ -2819,10 +2551,15 @@ void LidarIntensityORBMatchDual::callback(const sensor_msgs::PointCloud2ConstPtr
 
         if (enable_line_sampling_ && publish_sampled_cloud)
         {
-            if (samplePointCloudByRing(*cloud_in, sampled_cloud))
+            const bool use_corrected_cloud = sample_deskewed_cloud_ && !deskewed_cloud.data.empty();
+            const sensor_msgs::PointCloud2 &cloud_for_sampling =
+                use_corrected_cloud ? deskewed_cloud : *cloud_in;
+            if (samplePointCloudByRing(cloud_for_sampling, sampled_cloud))
             {
                 sampled_cloud.header = msg->header;
                 sampled_pub_.publish(sampled_cloud);
+                ROS_INFO("[Frame %d] sampled cloud source=%s",
+                         frame_idx_, use_corrected_cloud ? "deskewed" : "raw");
             }
         }
 
@@ -2843,10 +2580,10 @@ void LidarIntensityORBMatchDual::callback(const sensor_msgs::PointCloud2ConstPtr
         }
 
         // Update the previous-frame time reference (used for dt_guess of the next frame)
+        prev_scan_start_valid_ = cur_ts_ok;
         if (cur_ts_ok)
         {
             prev_scan_start_ts_ = cur_ts_min;
-            prev_scan_start_valid_ = true;
         }
 
         ROS_INFO("[Frame %d] matches: ORB=%zu 2D_inliers=%zu 3D_inliers=%zu",
