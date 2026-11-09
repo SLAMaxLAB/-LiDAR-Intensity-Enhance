@@ -1142,7 +1142,9 @@ bool LidarIntensityORBMatchDual::filterOriginPoints(const sensor_msgs::PointClou
         const float eps = std::max(0.0f, origin_filter_eps_);
 
         std::vector<uint8_t> out_data;
-        out_data.reserve(in.data.size());
+        out_data.resize(in.data.size());
+        uint8_t *out_ptr = out_data.data();
+        size_t out_off = 0;
 
         for (size_t idx = 0; idx < num_points; ++idx)
         {
@@ -1162,14 +1164,14 @@ bool LidarIntensityORBMatchDual::filterOriginPoints(const sensor_msgs::PointClou
                 continue;
             }
 
-            const size_t cur_off = out_data.size();
-            out_data.resize(cur_off + point_step);
-            std::memcpy(out_data.data() + cur_off, p, point_step);
+            std::memcpy(out_ptr + out_off, p, point_step);
+            out_off += point_step;
         }
 
         if (removed_points == 0)
             return false;
 
+        out_data.resize(out_off);
         out = in;
         out.data.swap(out_data);
         out.width = static_cast<uint32_t>(num_points - removed_points);
@@ -1734,10 +1736,11 @@ void LidarIntensityORBMatchDual::buildIntensityImageAngle(
             omp_threads = 1;
 #endif
 
+        const bool need_buckets = store_all_pixel_points_ && enable_joint_tguess_deskew_ && joint_pixel_match_mode_ == "all";
         std::vector<std::vector<PixAcc>> thread_grids(
             (size_t)omp_threads, std::vector<PixAcc>(total_pix));
         std::vector<std::vector<PixelPointRecord>> thread_point_records((size_t)omp_threads);
-        if (store_all_pixel_points_)
+        if (need_buckets)
         {
             const size_t reserve_per_thread =
                 std::max<size_t>(1024, num_points / static_cast<size_t>(std::max(1, omp_threads)));
@@ -1811,7 +1814,7 @@ void LidarIntensityORBMatchDual::buildIntensityImageAngle(
 
                 size_t pid = (size_t)v * h_res + (size_t)u;
                 PixAcc &cell = grid[pid];
-                if (store_all_pixel_points_)
+                if (need_buckets)
                     point_records.push_back(PixelPointRecord{pid, PixelPoint{x, y, z, intensity, timestamp}});
 
                 if (!cell.has_point || intensity > cell.max_intensity)
@@ -1849,7 +1852,8 @@ void LidarIntensityORBMatchDual::buildIntensityImageAngle(
                 }
             }
         }
-        materializePixelPointBuckets(total_pix, thread_point_records, pixel_points);
+        if (need_buckets)
+            materializePixelPointBuckets(total_pix, thread_point_records, pixel_points);
 
         // ---- output ----
         intensity_f = cv::Mat(v_res, h_res, CV_32F, cv::Scalar(0.0f));
@@ -1960,10 +1964,11 @@ void LidarIntensityORBMatchDual::buildIntensityImageRing(
             omp_threads = 1;
 #endif
 
+        const bool need_buckets = store_all_pixel_points_ && enable_joint_tguess_deskew_ && joint_pixel_match_mode_ == "all";
         std::vector<std::vector<PixAcc>> thread_grids(
             (size_t)omp_threads, std::vector<PixAcc>(total_pix));
         std::vector<std::vector<PixelPointRecord>> thread_point_records((size_t)omp_threads);
-        if (store_all_pixel_points_)
+        if (need_buckets)
         {
             const size_t reserve_per_thread =
                 std::max<size_t>(1024, num_points / static_cast<size_t>(std::max(1, omp_threads)));
@@ -2053,7 +2058,7 @@ void LidarIntensityORBMatchDual::buildIntensityImageRing(
 
                 size_t pid = (size_t)v * h_res + (size_t)u;
                 PixAcc &cell = grid[pid];
-                if (store_all_pixel_points_)
+                if (need_buckets)
                     point_records.push_back(PixelPointRecord{pid, PixelPoint{x, y, z, intensity, timestamp}});
 
                 if (!cell.has_point || intensity > cell.max_intensity)
@@ -2091,7 +2096,8 @@ void LidarIntensityORBMatchDual::buildIntensityImageRing(
                 }
             }
         }
-        materializePixelPointBuckets(total_pix, thread_point_records, pixel_points);
+        if (need_buckets)
+            materializePixelPointBuckets(total_pix, thread_point_records, pixel_points);
 
         // ---- output ----
         intensity_f = cv::Mat(v_res, h_res, CV_32F, cv::Scalar(0.0f));
@@ -2762,7 +2768,6 @@ void LidarIntensityORBMatchDual::callback(const sensor_msgs::PointCloud2ConstPtr
 
         }
         // ---------- 4.5) Use the optimized T(cur->prev) to deskew the current scan ----------
-        sensor_msgs::PointCloud2 cloud_for_sampling = *cloud_in; // default: filtered current frame
         sensor_msgs::PointCloud2 deskewed_cloud;
         cv::Mat corrected_cache_img, corrected_cache_desc;
         std::vector<cv::KeyPoint> corrected_cache_kp;
@@ -2787,11 +2792,12 @@ void LidarIntensityORBMatchDual::callback(const sensor_msgs::PointCloud2ConstPtr
                 R_use = R_scaled;
                 t_use = t_scaled;
             }
+            sensor_msgs::PointCloud2 deskew_working = *cloud_in;
             const bool deskew_applied =
-                deskewPointCloudInPlaceTimestamp(cloud_for_sampling, R_use, t_use);
+                deskewPointCloudInPlaceTimestamp(deskew_working, R_use, t_use);
             if (deskew_applied)
             {
-                deskewed_cloud = cloud_for_sampling;
+                deskewed_cloud = deskew_working;
                 corrected_cache_ready = rebuildFeatureCacheFromDeskewedCloud(
                     deskewed_cloud,
                     corrected_cache_img, corrected_cache_desc, corrected_cache_kp,
@@ -2813,7 +2819,7 @@ void LidarIntensityORBMatchDual::callback(const sensor_msgs::PointCloud2ConstPtr
 
         if (enable_line_sampling_ && publish_sampled_cloud)
         {
-            if (samplePointCloudByRing(cloud_for_sampling, sampled_cloud))
+            if (samplePointCloudByRing(*cloud_in, sampled_cloud))
             {
                 sampled_cloud.header = msg->header;
                 sampled_pub_.publish(sampled_cloud);
@@ -2825,10 +2831,15 @@ void LidarIntensityORBMatchDual::callback(const sensor_msgs::PointCloud2ConstPtr
 
         if (publish_deskewed_cloud)
         {
-            sensor_msgs::PointCloud2 cloud_to_publish =
-                deskewed_cloud.data.empty() ? cloud_for_sampling : deskewed_cloud;
-            cloud_to_publish.header = msg->header;
-            deskewedcloud_pub_.publish(cloud_to_publish);
+            if (!deskewed_cloud.data.empty())
+            {
+                deskewed_cloud.header = msg->header;
+                deskewedcloud_pub_.publish(deskewed_cloud);
+            }
+            else
+            {
+                deskewedcloud_pub_.publish(*cloud_in);
+            }
         }
 
         // Update the previous-frame time reference (used for dt_guess of the next frame)
